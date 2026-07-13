@@ -1,4 +1,4 @@
-// AnimeRestore OpenFX プラグイン v1（Phase 7）
+// AnimeRestore OpenFX プラグイン v2（Phase 7）
 //
 // docs/cpp_port_design.md 5章の設計を「まず動く」形に絞った初版：
 //   - render(t) ごとに t±TemporalRadius のフレームをホストから取得し、
@@ -8,10 +8,11 @@
 //     インスタンス内キャッシュ（グループ先頭時刻がキー）で再利用する
 //   - 時間方向アクセスが失敗するホストでは自動的にパススルーへ退化
 //
-// v1 で意図的に省いたもの（本設計5章に沿って後続で追加）：
-//   - 第2層（カット間拡張統合）・欠陥検出の個別トグル（ダストのみ実装）
-//   - クリップ全体の Analyze パス（現状はウィンドウ内検出で代替）
-//   - byte 深度（float RGBA のみ。DaVinci は float supply が既定）
+// v2 での追加：
+//   - 第2層（カット間拡張統合、Extend Neighbors パラメータ）＋第3層ブレンド
+//   - ラインノイズ / スキャンノイズ除去トグル
+//   - クリップ端処理（クランプ複製フレームの除外＋クリップ範囲の尊重）
+// 未搭載（今後）：傷除去（ショット横断解析が必要）、byte 深度、Analyze パス
 
 #include <cstdio>
 #include <cstring>
@@ -30,7 +31,9 @@
 #include "ofxParam.h"
 #include "ofxProperty.h"
 
+#include "animerestore/defects.h"
 #include "animerestore/denoise.h"
+#include "animerestore/extend.h"
 #include "animerestore/hold_detection.h"
 
 namespace {
@@ -57,12 +60,21 @@ void logLine(const char* fmt, ...) {
 
 // --- インスタンス状態 ----------------------------------------------------
 
+struct CachedGroup {
+    std::shared_ptr<GroupAnalysis> analysis;
+    cv::Mat extendedRef;          // 第2層適用後のR（未適用なら empty）
+    cv::Mat effectiveN;           // 第2層の実効Nマップ
+    std::vector<LineNoise> lineRows, lineCols;
+    std::vector<ScanNoise> scanH, scanV;
+    bool defectsScanned = false;
+};
+
 struct Instance {
     std::mutex mutex;
     // グループ解析キャッシュ：キーは「グループ先頭の絶対時刻＋画像幅」。
     // DaVinci はサムネイル（プロキシ）レンダーにも同じエフェクトを適用するため
     // （実測：92x46 が来る）、時刻だけをキーにするとサイズ違いの解析が衝突する
-    std::map<std::pair<double, int>, std::shared_ptr<GroupAnalysis>> cache;
+    std::map<std::pair<double, int>, std::shared_ptr<CachedGroup>> cache;
 };
 
 Instance* instanceOf(OfxImageEffectHandle effect) {
@@ -152,6 +164,9 @@ constexpr const char* kParamMode = "mode";
 constexpr const char* kParamRadius = "temporalRadius";
 constexpr const char* kParamDust = "dustRemoval";
 constexpr const char* kParamGrain = "grainReduction";
+constexpr const char* kParamExtend = "extendNeighbors";
+constexpr const char* kParamLineNoise = "lineNoiseRemoval";
+constexpr const char* kParamScanNoise = "scanNoiseRemoval";
 
 void defineParams(OfxImageEffectHandle effect) {
     OfxParamSetHandle params;
@@ -180,10 +195,30 @@ void defineParams(OfxImageEffectHandle effect) {
     gProp->propSetDouble(p, kOfxParamPropDefault, 0, 0.0);
     gProp->propSetDouble(p, kOfxParamPropMin, 0, 0.0);
     gProp->propSetDouble(p, kOfxParamPropMax, 0, 1.0);
+
+    gParam->paramDefine(params, kOfxParamTypeInteger, kParamExtend, &p);
+    gProp->propSetString(p, kOfxPropLabel, 0, "Extend Neighbors (Layer 2)");
+    gProp->propSetInt(p, kOfxParamPropDefault, 0, 2);
+    gProp->propSetInt(p, kOfxParamPropMin, 0, 0);
+    gProp->propSetInt(p, kOfxParamPropMax, 0, 3);
+
+    gParam->paramDefine(params, kOfxParamTypeBoolean, kParamLineNoise, &p);
+    gProp->propSetString(p, kOfxPropLabel, 0, "Line Noise Removal");
+    gProp->propSetInt(p, kOfxParamPropDefault, 0, 0);
+
+    gParam->paramDefine(params, kOfxParamTypeBoolean, kParamScanNoise, &p);
+    gProp->propSetString(p, kOfxPropLabel, 0, "Scan Noise Removal");
+    gProp->propSetInt(p, kOfxParamPropDefault, 0, 0);
 }
 
+struct PluginParams {
+    int extendNeighbors = 2;
+    bool lineNoise = false;
+    bool scanNoise = false;
+};
+
 void getParams(OfxImageEffectHandle effect, double t, DenoiseParams& p,
-               int& radius) {
+               int& radius, PluginParams& pp) {
     OfxParamSetHandle params;
     gEffect->getParamSet(effect, &params);
     OfxParamHandle h;
@@ -198,6 +233,15 @@ void getParams(OfxImageEffectHandle effect, double t, DenoiseParams& p,
         gParam->paramGetValueAtTime(h, t, &dust);
     if (gParam->paramGetHandle(params, kParamGrain, &h, nullptr) == kOfxStatOK)
         gParam->paramGetValueAtTime(h, t, &grain);
+    int ln = 0, sn = 0;
+    if (gParam->paramGetHandle(params, kParamExtend, &h, nullptr) == kOfxStatOK)
+        gParam->paramGetValueAtTime(h, t, &pp.extendNeighbors);
+    if (gParam->paramGetHandle(params, kParamLineNoise, &h, nullptr) == kOfxStatOK)
+        gParam->paramGetValueAtTime(h, t, &ln);
+    if (gParam->paramGetHandle(params, kParamScanNoise, &h, nullptr) == kOfxStatOK)
+        gParam->paramGetValueAtTime(h, t, &sn);
+    pp.lineNoise = ln != 0;
+    pp.scanNoise = sn != 0;
 
     p.mode = (mode == 1) ? DenoiseMode::FullTemporalIntegration
                          : DenoiseMode::TexturePreserving;
@@ -267,7 +311,8 @@ OfxStatus getFramesNeeded(OfxImageEffectHandle effect,
     gProp->propGetDouble(inArgs, kOfxPropTime, 0, &t);
     DenoiseParams p;
     int radius = 6;
-    getParams(effect, t, p, radius);
+    PluginParams pp;
+    getParams(effect, t, p, radius, pp);
     double range[2] = {t - radius, t + radius};
     gProp->propSetDoubleN(outArgs, "OfxImageClipPropFrameRange_Source", 2, range);
     return kOfxStatOK;
@@ -281,7 +326,8 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
 
     DenoiseParams p;
     int radius = 6;
-    getParams(effect, t, p, radius);
+    PluginParams pp;
+    getParams(effect, t, p, radius, pp);
 
     OfxImageClipHandle srcClip = nullptr, dstClip = nullptr;
     gEffect->clipGetHandle(effect, kOfxImageEffectSimpleSourceClipName, &srcClip,
@@ -305,66 +351,146 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         return kOfxStatOK;
     }
 
+    // クリップのフレーム範囲を取得（範囲外はホストがクランプ複製を返すため、
+    // そもそも要求しない。実測：クリップ先頭で複製がウィンドウに混入していた）
+    double clipRange[2] = {-1e18, 1e18};
+    {
+        OfxPropertySetHandle clipProps = nullptr;
+        if (gEffect->clipGetPropertySet(srcClip, &clipProps) == kOfxStatOK &&
+            clipProps) {
+            gProp->propGetDoubleN(clipProps, kOfxImageEffectPropFrameRange, 2,
+                                  clipRange);
+        }
+    }
+
     // ウィンドウ収集（取得に失敗した時刻はスキップ＝クリップ端で自然に縮む）
     std::vector<cv::Mat> window;
     std::vector<double> times;
     int centerIdx = -1;
     for (int dt = -radius; dt <= radius; ++dt) {
+        double tt = t + dt;
         if (dt == 0) {
             centerIdx = static_cast<int>(window.size());
             window.push_back(toMat(srcImg));
             times.push_back(t);
             continue;
         }
+        if (tt < clipRange[0] || tt > clipRange[1]) continue;
         OfxImg img;
-        if (!fetchImage(srcClip, t + dt, img)) continue;
+        if (!fetchImage(srcClip, tt, img)) continue;
         if (img.width() == srcImg.width() && img.height() == srcImg.height()) {
             window.push_back(toMat(img));
-            times.push_back(t + dt);
+            times.push_back(tt);
         }
         releaseImage(img);
     }
 
     cv::Mat result;
-    if (window.size() < 2) {
+    if (window.size() < 2 || centerIdx < 0) {
         // 時間方向アクセス不可のホスト：パススルーに退化（安全側）
         logLine("render t=%.1f: temporal access unavailable -> passthrough", t);
-        result = window[centerIdx >= 0 ? centerIdx : 0];
+        result = window.empty() ? toMat(srcImg)
+                                : window[std::max(centerIdx, 0)];
     } else {
-        // ウィンドウ内で保持グループ検出（ドリフト検査込み）→
-        // 現在フレームの属するグループを切り出す
+        // ウィンドウ内で保持グループ検出（ドリフト検査込み）
         DetectionThresholds th;
         auto groups = detectHoldGroups(window, th);
         groups = splitDriftingGroups(window, groups, th);
-        HoldGroup mine{centerIdx, centerIdx, 1.0, ""};
-        for (const auto& g : groups)
-            if (g.start <= centerIdx && centerIdx <= g.end) mine = g;
+        int mineIdx = -1;
+        for (size_t gi = 0; gi < groups.size(); ++gi)
+            if (groups[gi].start <= centerIdx && centerIdx <= groups[gi].end)
+                mineIdx = static_cast<int>(gi);
+        HoldGroup mine = (mineIdx >= 0) ? groups[mineIdx]
+                                        : HoldGroup{centerIdx, centerIdx, 1.0, ""};
 
-        // 解析キャッシュ：グループ先頭の絶対時刻＋画像幅がキー。
-        // 同一グループの各フレームの render で再利用される
-        auto cacheKey = std::make_pair(times[mine.start], srcImg.width());
         Instance* inst = instanceOf(effect);
-        std::shared_ptr<GroupAnalysis> analysis;
-        if (inst) {
-            std::lock_guard<std::mutex> lock(inst->mutex);
-            auto it = inst->cache.find(cacheKey);
-            if (it != inst->cache.end()) analysis = it->second;
-        }
-        if (!analysis) {
-            std::vector<cv::Mat> gf(window.begin() + mine.start,
-                                    window.begin() + mine.end + 1);
-            analysis = std::make_shared<GroupAnalysis>(analyzeHoldGroup(gf, p));
+        auto getCached = [&](const HoldGroup& g) -> std::shared_ptr<CachedGroup> {
+            auto key = std::make_pair(times[g.start], srcImg.width());
             if (inst) {
                 std::lock_guard<std::mutex> lock(inst->mutex);
-                if (inst->cache.size() > 8) inst->cache.clear();  // 簡易LRU
-                inst->cache[cacheKey] = analysis;
+                auto it = inst->cache.find(key);
+                if (it != inst->cache.end()) return it->second;
+            }
+            auto cg = std::make_shared<CachedGroup>();
+            std::vector<cv::Mat> gf(window.begin() + g.start,
+                                    window.begin() + g.end + 1);
+            cg->analysis = std::make_shared<GroupAnalysis>(analyzeHoldGroup(gf, p));
+            if (inst) {
+                std::lock_guard<std::mutex> lock(inst->mutex);
+                if (inst->cache.size() > 16) inst->cache.clear();  // 簡易LRU
+                inst->cache[key] = cg;
+            }
+            return cg;
+        };
+
+        std::shared_ptr<CachedGroup> center = getCached(mine);
+
+        // 第2層：カット間拡張統合（ウィンドウ内の隣接グループを統合に参加させる。
+        // 1コマ素材＝グループ長1でも時間統合が効くようになる本命機能）
+        if (pp.extendNeighbors > 0 && mineIdx >= 0 && center->extendedRef.empty()) {
+            std::vector<std::shared_ptr<CachedGroup>> keep;  // 生存保証
+            std::vector<const GroupAnalysis*> neighbors;
+            for (int j = mineIdx - pp.extendNeighbors;
+                 j <= mineIdx + pp.extendNeighbors; ++j) {
+                if (j < 0 || j >= static_cast<int>(groups.size()) || j == mineIdx)
+                    continue;
+                auto nb = getCached(groups[j]);
+                keep.push_back(nb);
+                neighbors.push_back(nb->analysis.get());
+            }
+            if (!neighbors.empty()) {
+                ExtendParams ep;
+                ep.radius = pp.extendNeighbors;
+                ExtendResult ext = extendReference(*center->analysis, neighbors, ep);
+                center->extendedRef = ext.reference;
+                center->effectiveN = ext.effectiveN;
             }
         }
-        auto outputs = renderHoldGroup(*analysis, p);
+
+        auto outputs = renderHoldGroup(*center->analysis, p,
+                                       center->extendedRef);
         result = outputs[centerIdx - mine.start];
-        logLine("render t=%.1f %dx%d window=%zu group=[%d-%d] sigma=%.2f", t,
-                srcImg.width(), srcImg.height(), window.size(), mine.start,
-                mine.end, analysis->grainSigma);
+
+        // 第3層：実効Nの低い画素にだけ空間NR（full モード時）
+        if (!center->effectiveN.empty() &&
+            p.mode == DenoiseMode::FullTemporalIntegration &&
+            p.grainReduction > 0) {
+            result = blendSpatialFallback(result, center->effectiveN,
+                                          center->analysis->grainSigma,
+                                          p.grainReduction);
+        }
+
+        // 欠陥トグル：ライン／スキャンノイズ（グループRで一度だけ検出し、
+        // 出力フレームに補正を適用）
+        if ((pp.lineNoise || pp.scanNoise) && !center->defectsScanned) {
+            const cv::Mat& ref = center->analysis->reference;
+            if (pp.lineNoise) {
+                center->lineRows = detectLineNoise(ref, 0);
+                center->lineCols = detectLineNoise(ref, 1);
+            }
+            if (pp.scanNoise) {
+                center->scanH = detectScanNoise(ref, 0);
+                center->scanV = detectScanNoise(ref, 1);
+            }
+            center->defectsScanned = true;
+        }
+        if (pp.lineNoise && (!center->lineRows.empty() || !center->lineCols.empty())) {
+            result = correctLineNoise(result, center->lineRows, 0);
+            result = correctLineNoise(result, center->lineCols, 1);
+        }
+        if (pp.scanNoise && (!center->scanH.empty() || !center->scanV.empty())) {
+            result = correctScanNoise(result, center->analysis->reference,
+                                      center->scanH, 0);
+            result = correctScanNoise(result, center->analysis->reference,
+                                      center->scanV, 1);
+        }
+
+        logLine("render t=%.1f %dx%d window=%zu group=[%d-%d] sigma=%.2f "
+                "ext=%s unsafe=%d",
+                t, srcImg.width(), srcImg.height(), window.size(), mine.start,
+                mine.end, center->analysis->grainSigma,
+                center->extendedRef.empty() ? "off" : "on",
+                center->analysis->integrationUnsafe ? 1 : 0);
     }
 
     writeMat(result, srcImg, dstImg);
@@ -403,7 +529,7 @@ OfxPlugin gPlugin = {
     kOfxImageEffectPluginApi,
     1,
     "jp.animerestore.denoise",
-    0, 1,
+    0, 2,
     setHost,
     mainEntry,
 };
