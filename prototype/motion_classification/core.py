@@ -231,22 +231,47 @@ def estimate_global_motion(frame_a: np.ndarray, frame_b: np.ndarray,
         if broken >= improved:
             motion_type = "static"
 
-    # マルチプレーン判定用の非等方性（ショット単位で集計して使う）：
-    # 真のズームは等方スケール（|sx-1|≈|sy-1|、ショット中央値0.94〜0.99）、
-    # 多層視差はパン方向の軸だけスケールが立つ（同0.60/0.28）。
-    # 遷移単位ではノイズで不安定なため（実測）、ここでは比率の記録のみ行い、
-    # 判定は dominant_global_motion がショット中央値で行う
+    # マルチプレーン対策（v4確定構成 = 評価29/30の最良値）：
+    # 多層視差のパンを前景基準の zoom/rotation と誤答する問題への対策。
+    #  (1) 非等方性：視差はパン方向の軸だけスケールが立つ（ratio<0.75）
+    #  (2) 面積対決：位相相関の並進モデルが同等以上の面積を説明するなら視差
+    # 既知の限界：真の超低速ズーム＋キャラ動き（02_Zoom_02）は両テストに
+    # 引っかかり pan と誤答する（29/30の残り1件）。フルアフィンが微小変位で
+    # ノイズに過適合するため統計量では分離不能と実測で確認済み
+    # （docs/phase1_phase2_status.md 参照）。分類ラベルの誤りであり、
+    # デノイズ品質には影響しない（統合可否はガード群が画素レベルで判断）
     scale_dev_ratio = None
-    if motion_type in ("zoom", "rotation") and matched_pts is not None:
-        a_full, _ = cv2.estimateAffine2D(
-            matched_pts[0], matched_pts[1], method=cv2.RANSAC,
-            ransacReprojThreshold=thresholds.ransac_reproj_threshold)
-        if a_full is not None:
-            sx = math.hypot(a_full[0, 0], a_full[1, 0])
-            sy = math.hypot(a_full[0, 1], a_full[1, 1])
-            dev_lo, dev_hi = sorted([abs(sx - 1.0), abs(sy - 1.0)])
-            if dev_hi > 0.005:
-                scale_dev_ratio = dev_lo / dev_hi
+    if motion_type in ("zoom", "rotation"):
+        is_parallax = False
+        if matched_pts is not None:
+            a_full, _ = cv2.estimateAffine2D(
+                matched_pts[0], matched_pts[1], method=cv2.RANSAC,
+                ransacReprojThreshold=thresholds.ransac_reproj_threshold)
+            if a_full is not None:
+                sx = math.hypot(a_full[0, 0], a_full[1, 0])
+                sy = math.hypot(a_full[0, 1], a_full[1, 1])
+                dev_lo, dev_hi = sorted([abs(sx - 1.0), abs(sy - 1.0)])
+                if dev_hi > 0.005:
+                    scale_dev_ratio = dev_lo / dev_hi
+                    if scale_dev_ratio < 0.75:
+                        is_parallax = True
+
+        (dx, dy), _ = cv2.phaseCorrelate(gray_a.astype(np.float32),
+                                         gray_b.astype(np.float32))
+        if not is_parallax:
+            warp_trans = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
+            t = 4.0
+            area_model = float((_tolerant_map_of(warp_pre_ecc) <= t).mean())
+            area_trans = float((_tolerant_map_of(warp_trans) <= t).mean())
+            is_parallax = area_trans >= area_model
+
+        if is_parallax:
+            if math.hypot(dx, dy) >= thresholds.static_translation_px:
+                motion_type = "pan"
+                tx, ty = float(dx), float(dy)
+                scale, rot = 1.0, 0.0
+            else:
+                motion_type = "static"
 
     return GlobalMotion(
         type=motion_type,
@@ -413,13 +438,5 @@ def dominant_global_motion(motions: list[GlobalMotion]) -> str:
         dominant = max(non_static, key=lambda k: non_static[k])
         if dominant == "pan" and analyze_camera_path(motions)["camera_shake"]:
             return "static"  # 方向が一貫しない並進＝シェイク（フィックス扱い）
-        if dominant in ("zoom", "rotation"):
-            # ショット単位の視差判定：zoom/rotation 遷移の非等方比の中央値が
-            # 低ければ多層視差のパンとみなす（実測較正：真のズーム0.94〜0.99、
-            # 視差0.60/0.28。遷移単位はノイズ支配のためショット集計が正解）
-            ratios = [m.scale_dev_ratio for m in motions
-                      if m.type == dominant and m.scale_dev_ratio is not None]
-            if len(ratios) >= 3 and float(np.median(ratios)) < 0.75:
-                return "pan"
         return dominant
     return counts.most_common(1)[0][0]

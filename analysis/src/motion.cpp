@@ -188,19 +188,52 @@ GlobalMotion estimateGlobalMotion(const cv::Mat& frameA, const cv::Mat& frameB,
         if (broken >= improved) type = "static";
     }
 
-    // マルチプレーン判定用の非等方性（ショット単位で集計して使う。
-    // 遷移単位はノイズで不安定なため記録のみ。Python側と同ロジック）
+    // マルチプレーン対策（v4確定構成 = 評価29/30の最良値。Python側と同値）：
+    //  (1) 非等方性 ratio<0.75 → 視差、(2) 面積対決 → 並進が同等以上なら視差。
+    // 既知の限界：真の超低速ズーム＋キャラ動き（02_Zoom_02）は pan と誤答
+    // （分類ラベルのみの問題でデノイズ品質には影響しない）
     double scaleDevRatio = -1;
-    if ((type == "zoom" || type == "rotation") && !matchedA.empty()) {
-        cv::Mat inliersFull;
-        cv::Mat aFull = cv::estimateAffine2D(matchedA, matchedB, inliersFull,
-                                             cv::RANSAC, th.ransacReprojThreshold);
-        if (!aFull.empty()) {
-            double sx = std::hypot(aFull.at<double>(0, 0), aFull.at<double>(1, 0));
-            double sy = std::hypot(aFull.at<double>(0, 1), aFull.at<double>(1, 1));
-            double devLo = std::min(std::abs(sx - 1.0), std::abs(sy - 1.0));
-            double devHi = std::max(std::abs(sx - 1.0), std::abs(sy - 1.0));
-            if (devHi > 0.005) scaleDevRatio = devLo / devHi;
+    if (type == "zoom" || type == "rotation") {
+        bool isParallax = false;
+        if (!matchedA.empty()) {
+            cv::Mat inliersFull;
+            cv::Mat aFull = cv::estimateAffine2D(matchedA, matchedB, inliersFull,
+                                                 cv::RANSAC, th.ransacReprojThreshold);
+            if (!aFull.empty()) {
+                double sx = std::hypot(aFull.at<double>(0, 0), aFull.at<double>(1, 0));
+                double sy = std::hypot(aFull.at<double>(0, 1), aFull.at<double>(1, 1));
+                double devLo = std::min(std::abs(sx - 1.0), std::abs(sy - 1.0));
+                double devHi = std::max(std::abs(sx - 1.0), std::abs(sy - 1.0));
+                if (devHi > 0.005) {
+                    scaleDevRatio = devLo / devHi;
+                    if (scaleDevRatio < 0.75) isParallax = true;
+                }
+            }
+        }
+        cv::Mat fa, fb;
+        grayA.convertTo(fa, CV_32F);
+        grayB.convertTo(fb, CV_32F);
+        cv::Point2d shift = cv::phaseCorrelate(fa, fb);
+        if (!isParallax) {
+            cv::Mat warpTrans =
+                (cv::Mat_<float>(2, 3) << 1, 0, shift.x, 0, 1, shift.y);
+            const float t = 4.0f;
+            double areaModel = cv::countNonZero(
+                tolerantResidualCropped(warpToB(grayA, warpPreEcc), grayB, th) <= t);
+            double areaTrans = cv::countNonZero(
+                tolerantResidualCropped(warpToB(grayA, warpTrans), grayB, th) <= t);
+            isParallax = areaTrans >= areaModel;
+        }
+        if (isParallax) {
+            if (std::hypot(shift.x, shift.y) >= th.staticTranslationPx) {
+                type = "pan";
+                tx = shift.x;
+                ty = shift.y;
+                scale = 1.0;
+                rot = 0.0;
+            } else {
+                type = "static";
+            }
         }
     }
 
@@ -333,19 +366,6 @@ std::string dominantGlobalMotion(const std::vector<GlobalMotion>& motions) {
         !dominant.empty()) {
         if (dominant == "pan" && analyzeCameraPath(motions).cameraShake) {
             return "static";  // 方向が一貫しない並進＝シェイク（フィックス扱い）
-        }
-        if (dominant == "zoom" || dominant == "rotation") {
-            // ショット単位の視差判定：非等方比の中央値が低ければ多層視差のパン
-            // （実測較正：真のズーム0.94〜0.99、視差0.60/0.28）
-            std::vector<double> ratios;
-            for (const auto& m : motions)
-                if (m.type == dominant && m.scaleDevRatio >= 0)
-                    ratios.push_back(m.scaleDevRatio);
-            if (ratios.size() >= 3) {
-                size_t mid = ratios.size() / 2;
-                std::nth_element(ratios.begin(), ratios.begin() + mid, ratios.end());
-                if (ratios[mid] < 0.75) return "pan";
-            }
         }
         return dominant;
     }
