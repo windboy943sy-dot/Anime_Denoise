@@ -1,0 +1,35 @@
+{
+ "dominant_koma_pattern": "3koma",
+ "hold_groups": [
+  {
+   "start": 0,
+   "end": 2,
+   "pattern": "3koma",
+   "confidence": 0.817
+  },
+  {
+   "start": 3,
+   "end": 5,
+   "pattern": "3koma",
+   "confidence": 0.81
+  },
+  {
+   "start": 6,
+   "end": 8,
+   "pattern": "3koma",
+   "confidence": 0.781
+  },
+  {
+   "start": 9,
+   "end": 11,
+   "pattern": "3koma",
+   "confidence": 0.815
+  },
+  {
+   "start": 12,
+   "end": 14,
+   "pattern": "3koma",
+   "confidence": 0.817
+  }
+ ]
+}

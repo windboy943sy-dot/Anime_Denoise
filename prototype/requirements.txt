@@ -1,0 +1,17 @@
+# Phase 1〜5 プロトタイプ検証用（対応：実装ロードマップ Phase 1-5）
+# Python 3.10+ を想定
+
+opencv-python>=4.9.0        # フレーム差分、SSIM、Optical Flow(Farneback)、ORB特徴点マッチング
+opencv-contrib-python>=4.9.0
+numpy>=1.26.0
+scipy>=1.12.0                # FFT周期解析（スキャンノイズ検出）、統計処理
+scikit-image>=0.22.0         # SSIM、形態学処理
+imagehash>=4.3.1              # pHash（粗選別）
+Pillow>=10.2.0
+matplotlib>=3.8.0             # 検証時の可視化（ヒストグラム、差分画像等）
+pandas>=2.2.0                 # ラベルCSVの読み書き、精度集計
+pyyaml>=6.0                   # 解析結果のシリアライズ設定
+
+# Phase 2でRAFT等の深層学習手法を試す場合（任意・後回しでよい）
+# torch>=2.2.0
+# torchvision>=0.17.0

@@ -1,0 +1,43 @@
+{
+ "scratch_columns": [
+  {
+   "x": 399,
+   "coverage": 0.539,
+   "strength": 16.71
+  },
+  {
+   "x": 400,
+   "coverage": 0.909,
+   "strength": 45.27
+  },
+  {
+   "x": 401,
+   "coverage": 0.904,
+   "strength": 45.91
+  },
+  {
+   "x": 402,
+   "coverage": 0.411,
+   "strength": 14.2
+  }
+ ],
+ "line_noise_rows": [
+  {
+   "index": 150,
+   "offset": 7.02,
+   "uniformity": 0.994
+  },
+  {
+   "index": 300,
+   "offset": -5.01,
+   "uniformity": 0.98
+  }
+ ],
+ "scan_noise": [
+  {
+   "period_px": 16.0,
+   "amplitude": 2.128,
+   "snr": 9.3
+  }
+ ]
+}

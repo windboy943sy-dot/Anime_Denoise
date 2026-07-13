@@ -1,0 +1,26 @@
+# macOS / AppleDouble（SMB共有由来）
+.DS_Store
+._*
+
+# Python
+__pycache__/
+*.pyc
+
+# C++ ビルド成果物
+analysis/build/
+
+# 外部SDK（取得方法は analysis/README.md 参照: git clone openfx）
+analysis/third_party/
+
+# テスト素材（38GB・権利物のためリポジトリには含めない）
+test-assets/raw/
+test-assets/denoised/
+test-assets/pipeline/
+test-assets/quality_check/
+
+# 生成物（run_*.py で再生成可能）
+test-assets/labels/detections/
+test-assets/labels/evaluation*/
+test-assets/labels/*_hold_groups.json
+test-assets/labels/*_motion.json
+test-assets/labels/*.numbers
