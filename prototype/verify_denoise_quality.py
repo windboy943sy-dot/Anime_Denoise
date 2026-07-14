@@ -91,6 +91,28 @@ def sample_pairs(path: str, n: int) -> list:
     return pairs
 
 
+def line_art_iou(orig: np.ndarray, processed: np.ndarray) -> float:
+    """線画IoU（★6、docs/reference/ 特化設計書4章の採用実装）。
+
+    XDoG線画マスク同士のIoU。Sobel系鮮鋭度と違いグレインに騙されない
+    「構造ベース」の指標。実測較正：健全なデノイズ出力 ≈0.80、
+    エッジ二重化（統合バグの実例）0.29、強いぼかし 0.53。
+    目安：0.75以上=線画維持、0.6未満=線の破壊を疑う。
+    ただし強ノイズ素材では元素材のマスク自体が不安定になり絶対値が下がる
+    （例：12_Dust_WhiteNoise_02 は元素材の隣接フレーム自己IoUが0.33）。
+    そのため main() では元素材の自己IoUを基準値として併記し、
+    「処理後IoU ≥ 自己IoU」なら線画は素材の自己一貫性以上に保たれていると読む。
+    前処理の medianBlur(3) はグレイン斑点のマスク混入を抑える（線は残る）。
+    """
+    from denoise.lineart import xdog_line_mask
+    a = cv2.medianBlur(orig, 3)
+    b = cv2.medianBlur(processed, 3)
+    ma = xdog_line_mask(a, dilate_px=1) > 0
+    mb = xdog_line_mask(b, dilate_px=1) > 0
+    union = np.logical_or(ma, mb).sum()
+    return float(np.logical_and(ma, mb).sum() / max(union, 1))
+
+
 def sample_video(path: str, n: int) -> list[np.ndarray]:
     cap = cv2.VideoCapture(path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -135,6 +157,12 @@ def main():
             "original": round(temporal_flicker(orig_pairs), 3),
             "processed": round(temporal_flicker(proc_pairs), 3),
         },
+        # 同一時刻のフレームペアで線画IoUを計算（サンプル平均）
+        "line_art_iou": round(float(np.mean(
+            [line_art_iou(a, b) for a, b in zip(orig, proc)])), 3),
+        # 基準値：元素材の隣接フレーム同士の自己IoU（強ノイズ素材ではこれ自体が低い）
+        "line_art_iou_self": round(float(np.mean(
+            [line_art_iou(a, b) for a, b in orig_pairs])), 3) if orig_pairs else None,
     }
 
     n = result["flat_hf_noise"]
@@ -142,9 +170,19 @@ def main():
     t = result["temporal_flicker"]
     noise_drop = (1 - n["processed"] / max(n["original"], 1e-6)) * 100
     sharp_delta = (e["processed"] / max(e["original"], 1e-6) - 1) * 100
+    iou = result["line_art_iou"]
+    self_iou = result["line_art_iou_self"]
+    if iou >= 0.75 or (self_iou is not None and iou >= self_iou):
+        iou_note = "OK"
+    elif iou >= 0.6:
+        iou_note = "注意"
+    else:
+        iou_note = "線の破壊を疑う"
     print(f"平坦部HFノイズ : {n['original']:6.2f} → {n['processed']:6.2f}  ({noise_drop:+.1f}% 削減)")
     print(f"エッジ鮮鋭度   : {e['original']:6.1f} → {e['processed']:6.1f}  ({sharp_delta:+.1f}%)")
     print(f"時間ちらつき   : {t['original']:6.3f} → {t['processed']:6.3f}")
+    self_str = f"{self_iou:.3f}" if self_iou is not None else "N/A"
+    print(f"線画IoU        : {iou:.3f}  [{iou_note}]（基準=元素材自己IoU {self_str}、目安0.75以上=維持）")
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
