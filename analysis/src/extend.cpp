@@ -34,14 +34,6 @@ cv::Mat tolerantLumaResidual(const cv::Mat& a32f3, const cv::Mat& b32f3) {
     return resid;
 }
 
-// Rから線画エッジマスク（5px膨張）。エッジは第2層統合から除外する
-cv::Mat edgeMaskOf(const cv::Mat& ref32f3) {
-    cv::Mat gray = lumaU8(ref32f3), edges;
-    cv::Canny(gray, edges, 50, 150);
-    cv::dilate(edges, edges, cv::Mat::ones(5, 5, CV_8U));
-    return edges;
-}
-
 }  // namespace
 
 ExtendResult extendReference(const GroupAnalysis& center,
@@ -56,7 +48,9 @@ ExtendResult extendReference(const GroupAnalysis& center,
     cv::Mat acc = refC * nC;
     r.effectiveN = cv::Mat(h, w, CV_32F, cv::Scalar(nC));
 
-    cv::Mat notEdge = ~edgeMaskOf(refC);
+    // エッジ除外マスクは denoise 側の XDoG 実装を共有（Python extend.py と同値。
+    // 従来ここだけ Canny のままでパリティが逸脱していた＝監査で発見・修正）
+    cv::Mat notEdge = ~lineArtEdgeMask(refC, 5);
 
     int my = static_cast<int>(h * p.activeAreaCrop);
     int mx = static_cast<int>(w * p.activeAreaCrop);

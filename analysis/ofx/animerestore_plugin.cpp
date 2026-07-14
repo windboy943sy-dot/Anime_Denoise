@@ -64,9 +64,14 @@ struct CachedGroup {
     std::shared_ptr<GroupAnalysis> analysis;
     cv::Mat extendedRef;          // 第2層適用後のR（未適用なら empty）
     cv::Mat effectiveN;           // 第2層の実効Nマップ
+    cv::Mat blendIn, blendOut;    // 第3層NLMのメモ（同一入力なら再利用）
     std::vector<LineNoise> lineRows, lineCols;
     std::vector<ScanNoise> scanH, scanV;
     bool defectsScanned = false;
+};
+
+struct DetectResult {
+    std::vector<HoldGroup> groups;
 };
 
 struct Instance {
@@ -75,6 +80,10 @@ struct Instance {
     // DaVinci はサムネイル（プロキシ）レンダーにも同じエフェクトを適用するため
     // （実測：92x46 が来る）、時刻だけをキーにするとサイズ違いの解析が衝突する
     std::map<std::pair<double, int>, std::shared_ptr<CachedGroup>> cache;
+    // ウィンドウ検出キャッシュ：同一 t の再レンダー（スクラブ時に同フレームが
+    // 連続要求される実測挙動）で pHash/SSIM の検出をやり直さないため。
+    // 検出は閾値固定＋ソースフレーム決定的なので同一キーなら結果も同一
+    std::map<std::pair<double, int>, std::shared_ptr<DetectResult>> detectCache;
 };
 
 Instance* instanceOf(OfxImageEffectHandle effect) {
@@ -392,10 +401,28 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         result = window.empty() ? toMat(srcImg)
                                 : window[std::max(centerIdx, 0)];
     } else {
-        // ウィンドウ内で保持グループ検出（ドリフト検査込み）
+        // ウィンドウ内で保持グループ検出（ドリフト検査込み）。
+        // 同一 t の再レンダー用にキャッシュする（結果は決定的で同一）
+        Instance* instD = instanceOf(effect);
+        auto detKey = std::make_pair(t, srcImg.width());
+        std::shared_ptr<DetectResult> det;
+        if (instD) {
+            std::lock_guard<std::mutex> lock(instD->mutex);
+            auto it = instD->detectCache.find(detKey);
+            if (it != instD->detectCache.end()) det = it->second;
+        }
         DetectionThresholds th;
-        auto groups = detectHoldGroups(window, th);
-        groups = splitDriftingGroups(window, groups, th);
+        if (!det) {
+            det = std::make_shared<DetectResult>();
+            det->groups = detectHoldGroups(window, th);
+            det->groups = splitDriftingGroups(window, det->groups, th);
+            if (instD) {
+                std::lock_guard<std::mutex> lock(instD->mutex);
+                if (instD->detectCache.size() > 64) instD->detectCache.clear();
+                instD->detectCache[detKey] = det;
+            }
+        }
+        const auto& groups = det->groups;
         int mineIdx = -1;
         for (size_t gi = 0; gi < groups.size(); ++gi)
             if (groups[gi].start <= centerIdx && centerIdx <= groups[gi].end)
@@ -455,9 +482,20 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         if (!center->effectiveN.empty() &&
             p.mode == DenoiseMode::FullTemporalIntegration &&
             p.grainReduction > 0) {
-            result = blendSpatialFallback(result, center->effectiveN,
-                                          center->analysis->grainSigma,
-                                          p.grainReduction);
+            // 同一グループの内部フレームは入力（=拡張R）が同一のため、
+            // NLM結果をメモ化して再利用（決定的処理なので出力もビット同一）
+            if (!center->blendIn.empty() &&
+                result.size() == center->blendIn.size() &&
+                std::memcmp(result.data, center->blendIn.data,
+                            result.total() * result.elemSize()) == 0) {
+                result = center->blendOut;
+            } else {
+                center->blendIn = result.clone();
+                result = blendSpatialFallback(result, center->effectiveN,
+                                              center->analysis->grainSigma,
+                                              p.grainReduction);
+                center->blendOut = result;
+            }
         }
 
         // 欠陥トグル：ライン／スキャンノイズ（グループRで一度だけ検出し、

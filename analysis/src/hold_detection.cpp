@@ -97,14 +97,29 @@ int phashDistance(uint64_t a, uint64_t b) {
     return static_cast<int>(__builtin_popcountll(a ^ b));
 }
 
-double blurredMeanAbsDiff(const cv::Mat& frameA, const cv::Mat& frameB, int ksize) {
-    cv::Mat ga, gb;
-    cv::GaussianBlur(toGray(frameA), ga, cv::Size(ksize, ksize), 0);
-    cv::GaussianBlur(toGray(frameB), gb, cv::Size(ksize, ksize), 0);
+namespace {
+
+// gray+GaussianBlur 済み画像（8U）を受け取る内部版。
+// 検出・ドリフト検査・refine が同一フレームの gray+blur を最大8回
+// 再計算していたため、呼び出し側で一度だけ計算してこちらに渡す
+// （数値は従来と完全同一）
+double blurredDiffFromGray(const cv::Mat& ga, const cv::Mat& gb) {
     cv::Mat fa, fb;
     ga.convertTo(fa, CV_32F);
     gb.convertTo(fb, CV_32F);
     return cv::mean(cv::abs(fa - fb))[0];
+}
+
+cv::Mat grayBlurred(const cv::Mat& frameBgr, int ksize) {
+    cv::Mat g;
+    cv::GaussianBlur(toGray(frameBgr), g, cv::Size(ksize, ksize), 0);
+    return g;
+}
+
+}  // namespace
+
+double blurredMeanAbsDiff(const cv::Mat& frameA, const cv::Mat& frameB, int ksize) {
+    return blurredDiffFromGray(grayBlurred(frameA, ksize), grayBlurred(frameB, ksize));
 }
 
 namespace {
@@ -147,12 +162,10 @@ double ssimUniform7(const cv::Mat& a8u, const cv::Mat& b8u) {
 
 }  // namespace
 
-double blockSsim(const cv::Mat& frameA, const cv::Mat& frameB,
-                 int blockSize, int blurKsize, double flatStdThreshold) {
-    cv::Mat ga, gb;
-    cv::GaussianBlur(toGray(frameA), ga, cv::Size(blurKsize, blurKsize), 0);
-    cv::GaussianBlur(toGray(frameB), gb, cv::Size(blurKsize, blurKsize), 0);
+namespace {
 
+double blockSsimFromGray(const cv::Mat& ga, const cv::Mat& gb,
+                         int blockSize, double flatStdThreshold) {
     double sum = 0.0;
     int count = 0;
     for (int y = 0; y + blockSize <= ga.rows; y += blockSize) {
@@ -179,10 +192,26 @@ double blockSsim(const cv::Mat& frameA, const cv::Mat& frameB,
     return count ? sum / count : 1.0;
 }
 
+}  // namespace
+
+double blockSsim(const cv::Mat& frameA, const cv::Mat& frameB,
+                 int blockSize, int blurKsize, double flatStdThreshold) {
+    return blockSsimFromGray(grayBlurred(frameA, blurKsize),
+                             grayBlurred(frameB, blurKsize),
+                             blockSize, flatStdThreshold);
+}
+
 std::vector<HoldGroup> detectHoldGroups(const std::vector<cv::Mat>& frames,
                                         const DetectionThresholds& th) {
     std::vector<HoldGroup> groups;
     if (frames.empty()) return groups;
+
+    // gray+blur は同一フレームが隣接2ペアで参照されるため遅延キャッシュする
+    std::vector<cv::Mat> gbCache(frames.size());
+    auto grayOf = [&](size_t i) -> const cv::Mat& {
+        if (gbCache[i].empty()) gbCache[i] = grayBlurred(frames[i], th.blurKsize);
+        return gbCache[i];
+    };
 
     int groupStart = 0;
     uint64_t prevHash = computePHash(frames[0]);
@@ -207,8 +236,9 @@ std::vector<HoldGroup> detectHoldGroups(const std::vector<cv::Mat>& frames,
         bool isSame = false;
         double conf = 0.0;
         if (quickScore <= th.coarsePhashThreshold) {
-            double diffScore = blurredMeanAbsDiff(frames[i - 1], frames[i], th.blurKsize);
-            double ssimScore = blockSsim(frames[i - 1], frames[i], th.blockSize, th.blurKsize);
+            double diffScore = blurredDiffFromGray(grayOf(i - 1), grayOf(i));
+            double ssimScore = blockSsimFromGray(grayOf(i - 1), grayOf(i),
+                                                 th.blockSize, 2.0);
             if (diffScore < th.diffThreshold && ssimScore > th.ssimThreshold) {
                 isSame = true;
                 conf = confidence(diffScore, ssimScore);
@@ -231,23 +261,32 @@ std::vector<HoldGroup> detectHoldGroups(const std::vector<cv::Mat>& frames,
 
 namespace {
 
-bool framesSame(const std::vector<cv::Mat>& frames, int a, int b,
-                const DetectionThresholds& th) {
-    double diff = blurredMeanAbsDiff(frames[a], frames[b], th.blurKsize);
+struct GrayCache {
+    const std::vector<cv::Mat>* frames;
+    int ksize;
+    std::vector<cv::Mat> cache;
+    const cv::Mat& operator()(int i) {
+        if (cache[i].empty()) cache[i] = grayBlurred((*frames)[i], ksize);
+        return cache[i];
+    }
+};
+
+bool framesSame(GrayCache& gc, int a, int b, const DetectionThresholds& th) {
+    double diff = blurredDiffFromGray(gc(a), gc(b));
     if (diff >= th.diffThreshold) return false;
-    return blockSsim(frames[a], frames[b], th.blockSize, th.blurKsize) > th.ssimThreshold;
+    return blockSsimFromGray(gc(a), gc(b), th.blockSize, 2.0) > th.ssimThreshold;
 }
 
-void splitRec(const std::vector<cv::Mat>& frames, int start, int end,
+void splitRec(GrayCache& gc, int start, int end,
               double confidence, const DetectionThresholds& th, int minSpan,
               std::vector<HoldGroup>& out) {
-    if (end - start + 1 <= minSpan || framesSame(frames, start, end, th)) {
+    if (end - start + 1 <= minSpan || framesSame(gc, start, end, th)) {
         out.push_back({start, end, confidence, ""});
         return;
     }
     int mid = (start + end) / 2;
-    splitRec(frames, start, mid, confidence * 0.8, th, minSpan, out);
-    splitRec(frames, mid + 1, end, confidence * 0.8, th, minSpan, out);
+    splitRec(gc, start, mid, confidence * 0.8, th, minSpan, out);
+    splitRec(gc, mid + 1, end, confidence * 0.8, th, minSpan, out);
 }
 
 }  // namespace
@@ -257,11 +296,12 @@ std::vector<HoldGroup> splitDriftingGroups(const std::vector<cv::Mat>& frames,
                                            const DetectionThresholds& th,
                                            int minSpan) {
     std::vector<HoldGroup> result;
+    GrayCache gc{&frames, th.blurKsize, std::vector<cv::Mat>(frames.size())};
     for (const auto& g : groups) {
         if (g.length() <= minSpan) {
             result.push_back(g);
         } else {
-            splitRec(frames, g.start, g.end, g.confidence, th, minSpan, result);
+            splitRec(gc, g.start, g.end, g.confidence, th, minSpan, result);
         }
     }
     return result;

@@ -38,11 +38,14 @@ double medianOf(cv::Mat m) {
     return v[k];
 }
 
+}  // namespace
+
 // 線画・セル境界のエッジマスク（Rから取る：生フレームだとグレインが
 // エッジ扱いになり保護マスクが画面全体に広がる）。
 // 実装は XDoG（Python: denoise/lineart.py と同値）。Canny は低コントラストの
 // 縞・グラデーション境界を落とし弧状誤検出の遠因になった（実測）。
-cv::Mat lineArtEdgeMask(const cv::Mat& reference, int dilatePx = 3) {
+// extend（第2層のエッジ除外）とも共有するため公開シンボルにしている
+cv::Mat lineArtEdgeMask(const cv::Mat& reference, int dilatePx) {
     const double sigma = 1.4, k = 1.6, tau = 0.98, epsilon = -0.3;
     cv::Mat gray = luma(reference);
     cv::Mat g1, g2;
@@ -55,17 +58,22 @@ cv::Mat lineArtEdgeMask(const cv::Mat& reference, int dilatePx = 3) {
     cv::morphologyEx(mask, mask, cv::MORPH_OPEN, cv::Mat::ones(2, 2, CV_8U));
     cv::Mat labels, stats, centroids;
     int n = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8);
-    cv::Mat out = cv::Mat::zeros(mask.size(), CV_8U);
+    // 線画は数百〜数千成分になるため、成分ごとの setTo（成分数×全画素の走査）
+    // ではなくラベルLUTの一括適用にする（結果はビット同一、O(HW)）
+    std::vector<uint8_t> keep(n, 0);
     for (int j = 1; j < n; ++j)
-        if (stats.at<int>(j, cv::CC_STAT_AREA) >= 12)
-            out.setTo(255, labels == j);
+        if (stats.at<int>(j, cv::CC_STAT_AREA) >= 12) keep[j] = 255;
+    cv::Mat out(mask.size(), CV_8U);
+    for (int y = 0; y < out.rows; ++y) {
+        const int32_t* lb = labels.ptr<int32_t>(y);
+        uint8_t* o = out.ptr<uint8_t>(y);
+        for (int x = 0; x < out.cols; ++x) o[x] = keep[lb[x]];
+    }
 
     if (dilatePx > 0)
         cv::dilate(out, out, cv::Mat::ones(dilatePx, dilatePx, CV_8U));
     return out;
 }
-
-}  // namespace
 
 std::vector<cv::Mat> alignGroupFrames(const std::vector<cv::Mat>& frames,
                                       const DenoiseParams& p) {
@@ -194,10 +202,14 @@ GroupAnalysis analyzeHoldGroup(const std::vector<cv::Mat>& frames,
     a.reference = computeReference(a.aligned, p);
     const int n = static_cast<int>(a.aligned.size());
 
-    // フリッカー推定（補正ONなら正規化してRを作り直す）
+    // フリッカー推定（補正ONなら正規化してRを作り直す）。
+    // ここで計算する luma は補正が入らなければ後段でそのまま再利用する
     cv::Mat refY = luma(a.reference);
-    for (const auto& f : a.aligned)
-        a.flickerOffsets.push_back(medianOf(luma(f) - refY));
+    std::vector<cv::Mat> lumas(n);
+    for (int i = 0; i < n; ++i) {
+        lumas[i] = luma(a.aligned[i]);
+        a.flickerOffsets.push_back(medianOf(lumas[i] - refY));
+    }
     bool anyFlicker = std::any_of(a.flickerOffsets.begin(), a.flickerOffsets.end(),
                                   [](double o) { return std::abs(o) > 0.25; });
     if (p.flickerCorrection && anyFlicker) {
@@ -209,12 +221,13 @@ GroupAnalysis analyzeHoldGroup(const std::vector<cv::Mat>& frames,
         }
         a.reference = computeReference(a.aligned, p);
         refY = luma(a.reference);
+        for (int i = 0; i < n; ++i) lumas[i] = luma(a.aligned[i]);  // 補正後に再計算
     }
 
     // 輝度残差スタックとグレインσ（MAD×1.4826、半正規分布のスケール推定）
     std::vector<cv::Mat> residual(n);
     for (int i = 0; i < n; ++i)
-        residual[i] = cv::abs(luma(a.aligned[i]) - refY);
+        residual[i] = cv::abs(lumas[i] - refY);
     {
         cv::Mat all;
         cv::vconcat(residual, all);
@@ -227,7 +240,7 @@ GroupAnalysis analyzeHoldGroup(const std::vector<cv::Mat>& frames,
     // 閾値は実測8ケースで較正：統合可 ≤4.1σ、不可 ≥6.2σ（Python側と同値）
     if (n >= 2) {
         cv::Mat midU8, guardEdges;
-        luma(a.aligned[n / 2]).convertTo(midU8, CV_8U);
+        lumas[n / 2].convertTo(midU8, CV_8U);
         cv::Canny(midU8, guardEdges, 50, 150);
         if (cv::countNonZero(guardEdges) > 0) {
             // 端±1を除いた内側端点で判定（フィルムの局所歪みは端フレームに
@@ -235,8 +248,8 @@ GroupAnalysis analyzeHoldGroup(const std::vector<cv::Mat>& frames,
             int ia = (n >= 4) ? 1 : 0;
             int ib = (n >= 4) ? n - 2 : n - 1;
             cv::Mat endA, endB;
-            cv::GaussianBlur(luma(a.aligned[ia]), endA, cv::Size(3, 3), 0);
-            cv::GaussianBlur(luma(a.aligned[ib]), endB, cv::Size(3, 3), 0);
+            cv::GaussianBlur(lumas[ia], endA, cv::Size(3, 3), 0);
+            cv::GaussianBlur(lumas[ib], endB, cv::Size(3, 3), 0);
             cv::Mat diff = cv::abs(endA - endB);
             std::vector<float> vals;
             for (int y = 0; y < diff.rows; ++y) {
