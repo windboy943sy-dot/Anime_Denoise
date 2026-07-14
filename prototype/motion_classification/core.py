@@ -185,6 +185,10 @@ def estimate_global_motion(frame_a: np.ndarray, frame_b: np.ndarray,
         mx = int(w * thresholds.active_area_crop)
         return resid[my:h - my, mx:w - mx]
 
+    # ECC前ワープの残差マップは ECCゲート・改善チェック・面積対決の3箇所で
+    # 使うため一度だけ計算する（数値は従来と完全同一）
+    resid_pre_map = _tolerant_map_of(warp_pre_ecc)
+
     # ECC でサブピクセル精度に追い込む（残差計算用のワープのみ。分類には使わない）
     if thresholds.use_ecc_refinement:
         try:
@@ -196,7 +200,7 @@ def estimate_global_motion(frame_a: np.ndarray, frame_b: np.ndarray,
             # ECCはグレインの強い素材で発散してワープを壊すことがあるため、
             # 実際に残差が改善した場合のみ採用する
             if float(_tolerant_map_of(warp_ecc).mean()) <= \
-                    float(_tolerant_map_of(warp_pre_ecc).mean()):
+                    float(resid_pre_map.mean()):
                 warp = warp_ecc
                 method += "+ecc"
                 confidence = max(confidence, float(np.clip(cc, 0.0, 1.0)))
@@ -224,10 +228,9 @@ def estimate_global_motion(frame_a: np.ndarray, frame_b: np.ndarray,
     # チェックは分類の根拠である ECC 前のワープで行う（ECCとは独立に判定）。
     if motion_type != "static":
         resid_id = _tolerant_map_of(None)
-        resid_warp = _tolerant_map_of(warp_pre_ecc)
         t = 4.0  # ぼかし・トレランス後のグレイン残差(1〜2)より十分上の閾値
-        improved = float(((resid_id > t) & (resid_warp <= t)).mean())
-        broken = float(((resid_id <= t) & (resid_warp > t)).mean())
+        improved = float(((resid_id > t) & (resid_pre_map <= t)).mean())
+        broken = float(((resid_id <= t) & (resid_pre_map > t)).mean())
         if broken >= improved:
             motion_type = "static"
 
@@ -261,7 +264,7 @@ def estimate_global_motion(frame_a: np.ndarray, frame_b: np.ndarray,
         if not is_parallax:
             warp_trans = np.array([[1, 0, dx], [0, 1, dy]], dtype=np.float32)
             t = 4.0
-            area_model = float((_tolerant_map_of(warp_pre_ecc) <= t).mean())
+            area_model = float((resid_pre_map <= t).mean())
             area_trans = float((_tolerant_map_of(warp_trans) <= t).mean())
             is_parallax = area_trans >= area_model
 

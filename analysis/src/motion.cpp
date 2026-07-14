@@ -142,6 +142,11 @@ GlobalMotion estimateGlobalMotion(const cv::Mat& frameA, const cv::Mat& frameB,
     decompose(warp, tx, ty, scale, rot);
     cv::Mat warpPreEcc = warp.clone();
 
+    // ECC前ワープの残差マップは ECCゲート・改善チェック・面積対決の3箇所で
+    // 使うため一度だけ計算する（数値は従来と完全同一）
+    cv::Mat residPreMap = tolerantResidualCropped(warpToB(grayA, warpPreEcc),
+                                                  grayB, th);
+
     // ECC精密化：残差が実際に改善した場合のみ採用
     // （グレインの強いパン素材でECCが発散しワープを壊す実測事例への対策）
     if (th.useEccRefinement) {
@@ -154,8 +159,7 @@ GlobalMotion estimateGlobalMotion(const cv::Mat& frameA, const cv::Mat& frameB,
                                              cv::noArray(), 5);
             double residEcc = cv::mean(
                 tolerantResidualCropped(warpToB(grayA, warpEcc), grayB, th))[0];
-            double residPre = cv::mean(
-                tolerantResidualCropped(warpToB(grayA, warpPreEcc), grayB, th))[0];
+            double residPre = cv::mean(residPreMap)[0];
             if (residEcc <= residPre) {
                 warp = warpEcc;
                 method += "+ecc";
@@ -179,10 +183,8 @@ GlobalMotion estimateGlobalMotion(const cv::Mat& frameA, const cv::Mat& frameB,
     // 平均残差比較はグレインが支配して機能しない
     if (type != "static") {
         cv::Mat residId = tolerantResidualCropped(grayA, grayB, th);
-        cv::Mat residWarp = tolerantResidualCropped(warpToB(grayA, warpPreEcc),
-                                                    grayB, th);
         const float t = 4.0f;
-        cv::Mat idHigh = residId > t, warpHigh = residWarp > t;
+        cv::Mat idHigh = residId > t, warpHigh = residPreMap > t;
         double improved = cv::countNonZero(idHigh & ~warpHigh);
         double broken = cv::countNonZero(~idHigh & warpHigh);
         if (broken >= improved) type = "static";
@@ -218,8 +220,7 @@ GlobalMotion estimateGlobalMotion(const cv::Mat& frameA, const cv::Mat& frameB,
             cv::Mat warpTrans =
                 (cv::Mat_<float>(2, 3) << 1, 0, shift.x, 0, 1, shift.y);
             const float t = 4.0f;
-            double areaModel = cv::countNonZero(
-                tolerantResidualCropped(warpToB(grayA, warpPreEcc), grayB, th) <= t);
+            double areaModel = cv::countNonZero(residPreMap <= t);
             double areaTrans = cv::countNonZero(
                 tolerantResidualCropped(warpToB(grayA, warpTrans), grayB, th) <= t);
             isParallax = areaTrans >= areaModel;

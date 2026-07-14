@@ -52,10 +52,10 @@ def xdog_line_mask(image: np.ndarray,
     # グレイン由来の孤立斑点を除去（線は連結して長い）
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    out = np.zeros_like(mask)
-    for j in range(1, n):
-        if stats[j, cv2.CC_STAT_AREA] >= 12:
-            out[labels == j] = 255
+    # 成分ごとの代入（成分数×全画素）ではなくラベルLUTで一括適用（結果は同一）
+    keep = np.zeros(n, np.uint8)
+    keep[1:][stats[1:, cv2.CC_STAT_AREA] >= 12] = 255
+    out = keep[labels]
 
     if dilate_px > 0:
         out = cv2.dilate(out, np.ones((dilate_px, dilate_px), np.uint8))

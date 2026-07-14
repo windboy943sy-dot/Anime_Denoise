@@ -324,9 +324,22 @@ int cmdDenoise(int argc, char** argv) {
             outputs = renderHoldGroup(center, p, ext.reference);
             if (p.mode == DenoiseMode::FullTemporalIntegration &&
                 p.grainReduction > 0) {
-                for (auto& o : outputs)
+                // fullモードのグループ内部フレームは出力（=拡張R）が完全同一
+                // なのに、同一入力へNLMを毎回再実行していた。直前と入力が
+                // ビット一致なら結果を再利用する（NLMは決定的なので出力も同一）
+                cv::Mat prevIn, prevOut;
+                for (auto& o : outputs) {
+                    if (!prevIn.empty() && o.size() == prevIn.size() &&
+                        std::memcmp(o.data, prevIn.data,
+                                    o.total() * o.elemSize()) == 0) {
+                        o = prevOut;
+                        continue;
+                    }
+                    prevIn = o.clone();
                     o = blendSpatialFallback(o, ext.effectiveN, center.grainSigma,
                                              p.grainReduction);
+                    prevOut = o;
+                }
             }
             std::printf("group [%d-%d] ext: neighbors=%d\n", groups[gi].start,
                         groups[gi].end, ext.usedNeighbors);
