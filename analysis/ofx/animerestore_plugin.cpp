@@ -169,6 +169,7 @@ void writeMat(const cv::Mat& m, const OfxImg& src, OfxImg& dst) {
 
 // --- パラメータ -----------------------------------------------------------
 
+constexpr const char* kParamSourceMedia = "sourceMedia";
 constexpr const char* kParamMode = "mode";
 constexpr const char* kParamRadius = "temporalRadius";
 constexpr const char* kParamDust = "dustRemoval";
@@ -181,6 +182,15 @@ void defineParams(OfxImageEffectHandle effect) {
     OfxParamSetHandle params;
     gEffect->getParamSet(effect, &params);
     OfxPropertySetHandle p;
+
+    // ソース世代（★3）。切り替えると欠陥トグル群に世代別の推奨既定値を
+    // 反映する（instanceChanged）。処理自体は変えないプリセット選択
+    gParam->paramDefine(params, kOfxParamTypeChoice, kParamSourceMedia, &p);
+    gProp->propSetString(p, kOfxPropLabel, 0, "Source Media");
+    gProp->propSetString(p, kOfxParamPropChoiceOption, 0, "Film Scan");
+    gProp->propSetString(p, kOfxParamPropChoiceOption, 1, "Video Tape");
+    gProp->propSetString(p, kOfxParamPropChoiceOption, 2, "Digital Native");
+    gProp->propSetInt(p, kOfxParamPropDefault, 0, 0);
 
     gParam->paramDefine(params, kOfxParamTypeChoice, kParamMode, &p);
     gProp->propSetString(p, kOfxPropLabel, 0, "Mode");
@@ -256,6 +266,40 @@ void getParams(OfxImageEffectHandle effect, double t, DenoiseParams& p,
                          : DenoiseMode::TexturePreserving;
     p.dustDetection = dust != 0;
     p.grainReduction = grain;
+}
+
+// Source Media 切り替え時：欠陥トグル群に世代別の推奨既定値を反映。
+// ユーザーがその後トグルを個別に変えれば当然そちらが生きる（単なる代入）
+OfxStatus instanceChanged(OfxImageEffectHandle effect,
+                          OfxPropertySetHandle inArgs) {
+    char* name = nullptr;
+    gProp->propGetString(inArgs, kOfxPropName, 0, &name);
+    if (!name || std::strcmp(name, kParamSourceMedia) != 0)
+        return kOfxStatReplyDefault;
+    // プロジェクト読み込み等ホスト起因の変更では反映しない
+    // （保存済みのトグル個別設定を上書きしてしまうため）
+    char* reason = nullptr;
+    gProp->propGetString(inArgs, kOfxPropChangeReason, 0, &reason);
+    if (reason && std::strcmp(reason, kOfxChangeUserEdited) != 0)
+        return kOfxStatReplyDefault;
+
+    OfxParamSetHandle params;
+    gEffect->getParamSet(effect, &params);
+    OfxParamHandle h;
+    int media = 0;
+    if (gParam->paramGetHandle(params, kParamSourceMedia, &h, nullptr) ==
+        kOfxStatOK)
+        gParam->paramGetValue(h, &media);
+    SourceMediaDefaults d = sourceMediaDefaults(static_cast<SourceMedia>(media));
+    if (gParam->paramGetHandle(params, kParamDust, &h, nullptr) == kOfxStatOK)
+        gParam->paramSetValue(h, d.dust ? 1 : 0);
+    if (gParam->paramGetHandle(params, kParamLineNoise, &h, nullptr) ==
+        kOfxStatOK)
+        gParam->paramSetValue(h, d.lineNoise ? 1 : 0);
+    if (gParam->paramGetHandle(params, kParamScanNoise, &h, nullptr) ==
+        kOfxStatOK)
+        gParam->paramSetValue(h, d.scanNoise ? 1 : 0);
+    return kOfxStatOK;
 }
 
 // --- アクション -----------------------------------------------------------
@@ -554,6 +598,8 @@ OfxStatus mainEntry(const char* action, const void* handle,
             return getFramesNeeded(effect, inArgs, outArgs);
         if (std::strcmp(action, kOfxImageEffectActionRender) == 0)
             return render(effect, inArgs);
+        if (std::strcmp(action, kOfxActionInstanceChanged) == 0)
+            return instanceChanged(effect, inArgs);
     } catch (const std::exception& e) {
         logLine("exception in %s: %s", action, e.what());
         return kOfxStatFailed;

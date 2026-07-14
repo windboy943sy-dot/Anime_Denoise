@@ -8,7 +8,10 @@
 //   ar_cli denoise-group --frames-dir <dir> --start N --end M --out-dir <dir>
 //   ar_cli denoise --input <video> --output <video>     # 一括デノイズ（run_denoise相当）
 //     [--mode full|texture] [--extend N] [--grain-reduction X]
+//     [--source-media film|video|digital] [--dust|--no-dust]
 //     [--dust-robust] [--no-drift-check]
+//     --source-media は世代別の推奨既定値（★3、現状はダスト検出の有無）。
+//     --dust/--no-dust の個別指定が常に優先
 //     メモ：入力フレームは全読み（検出のランダムアクセスのため）。解析は
 //     スライディングウィンドウ＋非同期先読みでメモリと時間を抑制
 
@@ -270,6 +273,21 @@ int cmdDenoise(int argc, char** argv) {
     p.mode = (modeStr == "full") ? DenoiseMode::FullTemporalIntegration
                                  : DenoiseMode::TexturePreserving;
     p.grainReduction = grainReduction;
+
+    // ソース世代の推奨既定値（★3）。個別フラグが常に優先。
+    // 行/列・スキャンノイズ除去は現状 OFX プラグインのみ（CLI 未配線）
+    std::string mediaStr = getArg(argc, argv, "--source-media", "film");
+    SourceMedia media = SourceMedia::FilmScan;
+    if (mediaStr == "video") media = SourceMedia::VideoTape;
+    else if (mediaStr == "digital") media = SourceMedia::DigitalNative;
+    else if (mediaStr != "film") {
+        std::fprintf(stderr, "--source-media は film|video|digital: %s\n",
+                     mediaStr.c_str());
+        return 1;
+    }
+    p.dustDetection = sourceMediaDefaults(media).dust;
+    if (hasFlag(argc, argv, "--dust")) p.dustDetection = true;
+    if (hasFlag(argc, argv, "--no-dust")) p.dustDetection = false;
 
     // 解析はスライディングウィンドウ（中心±radius）で保持し、
     // 次に必要になるグループを非同期に先読みする（メモリ抑制＋パイプライン重畳）

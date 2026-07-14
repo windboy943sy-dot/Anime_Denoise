@@ -13,6 +13,22 @@ namespace animerestore {
 enum class DenoiseMode { TexturePreserving, FullTemporalIntegration };
 enum class ReferenceMethod { Median, TrimmedMean, Mean };
 
+// ソース世代（★3、docs/design_integration_review.md）。
+// 現行の処理内容は3世代とも共通で、これは「どの欠陥除去を既定で有効に
+// するか」の推奨値を切り替えるだけ。ビデオ収録特有の処理
+// （デインターレース・クロマにじみ）とデジタル特有の処理（バンディング）
+// は将来ここへフックする前提のパラメータ設計
+enum class SourceMedia { FilmScan, VideoTape, DigitalNative };
+
+struct SourceMediaDefaults {
+    bool dust;       // フィルムのダスト・ダート（ビデオ/デジタルでは誤検出源）
+    bool lineNoise;  // テープドロップアウト由来の行/列ノイズ
+    bool scanNoise;  // スキャナ/伝送系の周期ノイズ
+};
+
+// 世代別の推奨既定値。UI/CLI で共有し、ユーザーの個別指定は常にこれを上書き
+SourceMediaDefaults sourceMediaDefaults(SourceMedia m);
+
 struct DenoiseParams {
     // 位置合わせ
     bool align = true;

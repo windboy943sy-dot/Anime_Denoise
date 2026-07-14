@@ -15,6 +15,21 @@
 
 namespace animerestore {
 
+SourceMediaDefaults sourceMediaDefaults(SourceMedia m) {
+    switch (m) {
+        case SourceMedia::VideoTape:
+            // ダスト検出はフィルム前提（単発性・形状条件がテープノイズと
+            // 相性が悪い）。ドロップアウトは行/列ノイズ検出器が受け持つ
+            return {false, true, false};
+        case SourceMedia::DigitalNative:
+            // 物理欠陥なし。バンディング等は将来の専用処理（★5）
+            return {false, false, false};
+        case SourceMedia::FilmScan:
+        default:
+            return {true, false, false};
+    }
+}
+
 namespace {
 
 cv::Mat luma(const cv::Mat& frame) {
