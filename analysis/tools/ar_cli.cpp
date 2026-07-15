@@ -79,6 +79,9 @@ int cmdDetect(int argc, char** argv) {
     }
 
     DetectionThresholds th;
+    if (hasFlag(argc, argv, "--region-segment")) {
+        th.useRegionSegment = true;
+    }
     auto groups = detectHoldGroups(frames, th);
     if (!hasFlag(argc, argv, "--no-drift-check")) {
         groups = splitDriftingGroups(frames, groups, th);
@@ -262,6 +265,9 @@ int cmdDenoise(int argc, char** argv) {
 
     // Phase 1：検出（＋オプションのダスト耐性再判定、既定でドリフト検査）
     DetectionThresholds th;
+    if (hasFlag(argc, argv, "--region-segment")) {
+        th.useRegionSegment = true;
+    }
     auto groups = detectHoldGroups(frames, th);
     if (hasFlag(argc, argv, "--dust-robust"))
         groups = refineHoldGroups(frames, groups, th);

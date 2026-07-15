@@ -46,6 +46,7 @@ class DetectionThresholds:
     ssim_threshold: float = 0.92          # ブロック単位SSIMの平均値のしきい値
     block_size: int = 32                  # ブロックSSIMのブロックサイズ(px)
     blur_ksize: int = 5                   # ぼかし後差分に使うガウシアンぼかしのカーネルサイズ
+    use_region_segment: bool = False      # 領域別（マルチプレーン）保持判定を有効化するフラグ
 
 
 def _to_gray(frame_bgr: np.ndarray) -> np.ndarray:
@@ -99,6 +100,83 @@ def block_ssim(frame_a: np.ndarray, frame_b: np.ndarray, block_size: int,
     return float(np.mean(scores)) if scores else 1.0
 
 
+def block_ssim_masked(gray_a: np.ndarray, gray_b: np.ndarray, mask: np.ndarray, block_size: int,
+                      flat_std_threshold: float = 2.0) -> float:
+    h, w = gray_a.shape
+    scores = []
+    for y in range(0, h - block_size + 1, block_size):
+        for x in range(0, w - block_size + 1, block_size):
+            block_mask = mask[y:y + block_size, x:x + block_size]
+            if np.count_nonzero(block_mask) < (block_size * block_size * 0.20):
+                continue
+            block_a = gray_a[y:y + block_size, x:x + block_size]
+            block_b = gray_b[y:y + block_size, x:x + block_size]
+            if block_a.std() < flat_std_threshold and block_b.std() < flat_std_threshold:
+                diff = np.mean(np.abs(block_a.astype(np.float32) - block_b.astype(np.float32)))
+                scores.append(max(0.0, 1.0 - diff / 255.0))
+                continue
+            score = ssim(block_a, block_b, data_range=255)
+            scores.append(score)
+    return float(np.mean(scores)) if scores else 1.0
+
+
+def blurred_mean_abs_diff_masked(gray_a: np.ndarray, gray_b: np.ndarray, mask: np.ndarray) -> float:
+    diff = np.abs(gray_a.astype(np.float32) - gray_b.astype(np.float32))
+    return float(np.mean(diff[mask > 0])) if np.any(mask > 0) else 0.0
+
+
+def estimate_global_motion(ref_gray: np.ndarray, mov_gray: np.ndarray) -> np.ndarray | None:
+    orb = cv2.ORB_create(nfeatures=300)
+    kp1, des1 = orb.detectAndCompute(ref_gray, None)
+    kp2, des2 = orb.detectAndCompute(mov_gray, None)
+    if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
+        return None
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    if len(matches) < 4:
+        return None
+    matches = sorted(matches, key=lambda x: x.distance)
+    src_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    # RANSACの閾値を1.5に絞り、精密な背景合わせを行う
+    warp, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=1.5)
+    if warp is None or np.sum(inliers) < 4:
+        return None
+
+    # スケール成分の取り出しと剛体正規化
+    a = warp[0, 0]
+    b = warp[1, 0]
+    s = np.sqrt(a*a + b*b)
+    # スケール変化が許容範囲外（3%以上）なら前景への引きずりとみなす
+    if not (0.97 <= s <= 1.03):
+        return None
+
+    if s > 0.001:
+        warp[0, 0] /= s
+        warp[0, 1] /= s
+        warp[1, 0] /= s
+        warp[1, 1] /= s
+    return warp
+
+
+def is_significant_motion(warp: np.ndarray) -> bool:
+    tx, ty = warp[0, 2], warp[1, 2]
+    a, b = warp[0, 0], warp[1, 0]
+    theta = abs(np.arctan2(b, a))
+    return bool((np.sqrt(tx**2 + ty**2) > 0.5) or (theta > 0.002))
+
+
+def compute_foreground_mask(ref_gray: np.ndarray, mov_gray: np.ndarray, warp: np.ndarray) -> np.ndarray:
+    warped = cv2.warpAffine(mov_gray, warp, (ref_gray.shape[1], ref_gray.shape[0]),
+                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    diff = cv2.absdiff(ref_gray, warped)
+    _, mask = cv2.threshold(diff, 12, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return mask
+
+
 def _confidence(diff_score: float, ssim_score: float, thresholds: DetectionThresholds) -> float:
     """diffとssimがしきい値からどれだけ余裕を持って「同一」判定されたかをスコア化する。
     0〜1に正規化し、1に近いほど「確実に同一フレーム」と判断できる。
@@ -139,9 +217,35 @@ def detect_hold_groups(
         conf = 0.0
 
         if quick_score <= thresholds.coarse_phash_threshold:
-            diff_score = blurred_mean_abs_diff(frames[i - 1], frames[i], thresholds.blur_ksize)
-            ssim_score = block_ssim(frames[i - 1], frames[i], thresholds.block_size,
-                                    blur_ksize=thresholds.blur_ksize)
+            diff_score = 0.0
+            ssim_score = 0.0
+            if thresholds.use_region_segment:
+                gray_a = cv2.GaussianBlur(_to_gray(frames[i - 1]), (thresholds.blur_ksize, thresholds.blur_ksize), 0)
+                gray_b = cv2.GaussianBlur(_to_gray(frames[i]), (thresholds.blur_ksize, thresholds.blur_ksize), 0)
+                warp = estimate_global_motion(gray_a, gray_b)
+                if warp is not None and is_significant_motion(warp):
+                    fg_mask = compute_foreground_mask(gray_a, gray_b, warp)
+                    fg_area_ratio = float(np.count_nonzero(fg_mask)) / fg_mask.size
+                    if 0.01 <= fg_area_ratio <= 0.80:
+                        diff_score = blurred_mean_abs_diff_masked(gray_a, gray_b, fg_mask)
+                        ssim_score = block_ssim_masked(gray_a, gray_b, fg_mask, thresholds.block_size)
+                    else:
+                        # 全体アフィンパン: ワープ後の全体画像を比較
+                        warped_frame_b = cv2.warpAffine(frames[i], warp, (frames[i - 1].shape[1], frames[i - 1].shape[0]),
+                                                        flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+                        diff_score = blurred_mean_abs_diff(frames[i - 1], warped_frame_b, thresholds.blur_ksize)
+                        ssim_score = block_ssim(frames[i - 1], warped_frame_b, thresholds.block_size,
+                                                blur_ksize=thresholds.blur_ksize)
+                else:
+                    diff_score = blurred_mean_abs_diff(frames[i - 1], frames[i], thresholds.blur_ksize)
+                    ssim_score = block_ssim(frames[i - 1], frames[i], thresholds.block_size,
+                                            blur_ksize=thresholds.blur_ksize)
+            else:
+                diff_score = blurred_mean_abs_diff(frames[i - 1], frames[i], thresholds.blur_ksize)
+                ssim_score = block_ssim(frames[i - 1], frames[i], thresholds.block_size,
+                                        blur_ksize=thresholds.blur_ksize)
+
+
 
             if diff_score < thresholds.diff_threshold and ssim_score > thresholds.ssim_threshold:
                 is_same = True

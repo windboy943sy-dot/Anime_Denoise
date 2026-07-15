@@ -24,6 +24,7 @@ struct DetectionThresholds {
     double ssimThreshold = 0.92;    // ブロックSSIM平均
     int blockSize = 32;
     int blurKsize = 5;
+    bool useRegionSegment = false;  // 領域別（マルチプレーン）保持判定を有効化するフラグ
 };
 
 }  // namespace animerestore

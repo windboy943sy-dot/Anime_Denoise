@@ -17,9 +17,11 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -70,20 +72,41 @@ struct CachedGroup {
     bool defectsScanned = false;
 };
 
+// グループ解析キャッシュのメモリ上限（合計推定バイト）。個数ではなくバイトで
+// 制限することで、長いホールドグループが並んでも総メモリが一定に収まる。
+// 将来 OFX パラメータ「Cache Budget」で可変化する余地あり（今は控えめ固定）
+constexpr size_t kCacheBudgetBytes = 512ull << 20;  // 512MB
+
+inline size_t matBytes(const cv::Mat& m) {
+    return m.empty() ? 0 : m.total() * m.elemSize();
+}
+
+// CachedGroup 1個の推定保持バイト数（保持している全 cv::Mat の合計）
+size_t estimateBytes(const CachedGroup& cg) {
+    size_t b = 0;
+    if (cg.analysis) {
+        for (const auto& f : cg.analysis->aligned) b += matBytes(f);
+        b += matBytes(cg.analysis->reference);
+        for (const auto& m : cg.analysis->dustMasks) b += matBytes(m);
+        b += matBytes(cg.analysis->motionGuard);
+    }
+    b += matBytes(cg.extendedRef) + matBytes(cg.effectiveN);
+    b += matBytes(cg.blendIn) + matBytes(cg.blendOut);
+    return b;
+}
+
 struct DetectResult {
     std::vector<HoldGroup> groups;
 };
 
 struct Instance {
-    std::mutex mutex;
+    mutable std::shared_mutex mutex;
     // グループ解析キャッシュ：キーは「グループ先頭の絶対時刻＋画像幅」。
-    // DaVinci はサムネイル（プロキシ）レンダーにも同じエフェクトを適用するため
-    // （実測：92x46 が来る）、時刻だけをキーにするとサイズ違いの解析が衝突する
     std::map<std::pair<double, int>, std::shared_ptr<CachedGroup>> cache;
-    // ウィンドウ検出キャッシュ：同一 t の再レンダー（スクラブ時に同フレームが
-    // 連続要求される実測挙動）で pHash/SSIM の検出をやり直さないため。
-    // 検出は閾値固定＋ソースフレーム決定的なので同一キーなら結果も同一
+    std::list<std::pair<double, int>> cacheOrder;
+    // ウィンドウ検出キャッシュ
     std::map<std::pair<double, int>, std::shared_ptr<DetectResult>> detectCache;
+    std::list<std::pair<double, int>> detectCacheOrder;
 };
 
 Instance* instanceOf(OfxImageEffectHandle effect) {
@@ -395,190 +418,264 @@ OfxStatus render(OfxImageEffectHandle effect, OfxPropertySetHandle inArgs) {
         return kOfxStatFailed;
     }
 
-    // プロキシ／サムネイルレンダー（実測：92x46等）は解析せずパススルー。
-    // 縮小画像では検出・σ推定が意味を持たず、計算の無駄になるだけ
-    if (renderScale[0] < 0.999 || srcImg.width() < 512) {
-        writeMat(toMat(srcImg), srcImg, dstImg);
+    try {
+        // プロキシ／サムネイルレンダー（実測：92x46等）は解析せずパススルー。
+        // 縮小画像では検出・σ推定が意味を持たず、計算の無駄になるだけ
+        if (renderScale[0] < 0.999 || srcImg.width() < 512) {
+            writeMat(toMat(srcImg), srcImg, dstImg);
+            releaseImage(srcImg);
+            releaseImage(dstImg);
+            return kOfxStatOK;
+        }
+
+        // クリップのフレーム範囲を取得（範囲外はホストがクランプ複製を返すため、
+        // そもそも要求しない。実測：クリップ先頭で複製がウィンドウに混入していた）
+        double clipRange[2] = {-1e18, 1e18};
+        {
+            OfxPropertySetHandle clipProps = nullptr;
+            if (gEffect->clipGetPropertySet(srcClip, &clipProps) == kOfxStatOK &&
+                clipProps) {
+                gProp->propGetDoubleN(clipProps, kOfxImageEffectPropFrameRange, 2,
+                                      clipRange);
+            }
+        }
+
+        // ウィンドウ収集（取得に失敗した時刻はスキップ＝クリップ端で自然に縮む）
+        std::vector<cv::Mat> window;
+        std::vector<double> times;
+        int centerIdx = -1;
+        for (int dt = -radius; dt <= radius; ++dt) {
+            double tt = t + dt;
+            if (dt == 0) {
+                centerIdx = static_cast<int>(window.size());
+                window.push_back(toMat(srcImg));
+                times.push_back(t);
+                continue;
+            }
+            if (tt < clipRange[0] || tt > clipRange[1]) continue;
+            OfxImg img;
+            if (!fetchImage(srcClip, tt, img)) continue;
+            if (img.width() == srcImg.width() && img.height() == srcImg.height()) {
+                window.push_back(toMat(img));
+                times.push_back(tt);
+            }
+            releaseImage(img);
+        }
+
+        cv::Mat result;
+        if (window.size() < 2 || centerIdx < 0) {
+            // 時間方向アクセス不可のホスト：パススルーに退化（安全側）
+            logLine("render t=%.1f: temporal access unavailable -> passthrough", t);
+            result = window.empty() ? toMat(srcImg)
+                                    : window[std::max(centerIdx, 0)];
+        } else {
+            // ウィンドウ内で保持グループ検出（ドリフト検査込み）。
+            // 同一 t の再レンダー用にキャッシュする（結果は決定的で同一）
+            Instance* instD = instanceOf(effect);
+            auto detKey = std::make_pair(t, srcImg.width());
+            std::shared_ptr<DetectResult> det;
+            if (instD) {
+                // 読込ロックでヒット確認
+                {
+                    std::shared_lock<std::shared_mutex> lock(instD->mutex);
+                    auto it = instD->detectCache.find(detKey);
+                    if (it != instD->detectCache.end()) {
+                        det = it->second;
+                    }
+                }
+                // ヒットした場合は順序を更新
+                if (det) {
+                    std::unique_lock<std::shared_mutex> lock(instD->mutex);
+                    // shared_lock 解放から再ロックの間に別スレッドが detKey を
+                    // 追い出した可能性がある。マップに現存するキーのみ順序へ戻す
+                    // （消えたキーを push_front すると order/map が不整合になる）
+                    if (instD->detectCache.count(detKey)) {
+                        instD->detectCacheOrder.remove(detKey);
+                        instD->detectCacheOrder.push_front(detKey);
+                    }
+                }
+            }
+            DetectionThresholds th;
+            if (!det) {
+                det = std::make_shared<DetectResult>();
+                det->groups = detectHoldGroups(window, th);
+                det->groups = splitDriftingGroups(window, det->groups, th);
+                if (instD) {
+                    std::unique_lock<std::shared_mutex> lock(instD->mutex);
+                    auto it = instD->detectCache.find(detKey);
+                    if (it != instD->detectCache.end()) {
+                        det = it->second; // 他のスレッドが先に登録していた場合
+                    } else {
+                        instD->detectCache[detKey] = det;
+                        instD->detectCacheOrder.push_front(detKey);
+                        while (instD->detectCache.size() > 64) {
+                            auto lastKey = instD->detectCacheOrder.back();
+                            instD->detectCacheOrder.pop_back();
+                            instD->detectCache.erase(lastKey);
+                        }
+                    }
+                }
+            }
+            const auto& groups = det->groups;
+            int mineIdx = -1;
+            for (size_t gi = 0; gi < groups.size(); ++gi)
+                if (groups[gi].start <= centerIdx && centerIdx <= groups[gi].end)
+                    mineIdx = static_cast<int>(gi);
+            HoldGroup mine = (mineIdx >= 0) ? groups[mineIdx]
+                                            : HoldGroup{centerIdx, centerIdx, 1.0, ""};
+
+            Instance* inst = instanceOf(effect);
+            auto getCached = [&](const HoldGroup& g) -> std::shared_ptr<CachedGroup> {
+                auto key = std::make_pair(times[g.start], srcImg.width());
+                if (inst) {
+                    // 読込ロックでヒット確認
+                    {
+                        std::shared_lock<std::shared_mutex> lock(inst->mutex);
+                        auto it = inst->cache.find(key);
+                        if (it != inst->cache.end()) {
+                            lock.unlock();
+                            // 順序の更新
+                            std::unique_lock<std::shared_mutex> ulock(inst->mutex);
+                            auto it2 = inst->cache.find(key);
+                            if (it2 != inst->cache.end()) {
+                                inst->cacheOrder.remove(key);
+                                inst->cacheOrder.push_front(key);
+                                return it2->second;
+                            }
+                        }
+                    }
+                }
+                // 重い計算はロックの外で行う
+                auto cg = std::make_shared<CachedGroup>();
+                std::vector<cv::Mat> gf(window.begin() + g.start,
+                                        window.begin() + g.end + 1);
+                cg->analysis = std::make_shared<GroupAnalysis>(analyzeHoldGroup(gf, p));
+                if (inst) {
+                    std::unique_lock<std::shared_mutex> lock(inst->mutex);
+                    auto it = inst->cache.find(key);
+                    if (it != inst->cache.end()) {
+                        return it->second; // 他のスレッドが先に登録していた場合
+                    }
+                    inst->cache[key] = cg;
+                    inst->cacheOrder.push_front(key);
+                    // バイト上限LRU：合計推定サイズが上限を超える間、最古から
+                    // 1個ずつ追い出す。追加直後のエントリ（key）は必ず残すため、
+                    // 少なくとも1個は保持される（総量が単一グループでも上限超なら1個）
+                    while (inst->cacheOrder.size() > 1) {
+                        size_t total = 0;
+                        for (const auto& kv : inst->cache)
+                            if (kv.second) total += estimateBytes(*kv.second);
+                        if (total <= kCacheBudgetBytes) break;
+                        auto lastKey = inst->cacheOrder.back();
+                        if (lastKey == key) break;  // 今入れたものは追い出さない
+                        inst->cacheOrder.pop_back();
+                        inst->cache.erase(lastKey);
+                    }
+                }
+                return cg;
+            };
+
+            std::shared_ptr<CachedGroup> center = getCached(mine);
+
+            // 第2層：カット間拡張統合（ウィンドウ内の隣接グループを統合に参加させる。
+            // 1コマ素材＝グループ長1でも時間統合が効くようになる本命機能）
+            if (pp.extendNeighbors > 0 && mineIdx >= 0 && center->extendedRef.empty()) {
+                std::vector<std::shared_ptr<CachedGroup>> keep;  // 生存保証
+                std::vector<const GroupAnalysis*> neighbors;
+                for (int j = mineIdx - pp.extendNeighbors;
+                     j <= mineIdx + pp.extendNeighbors; ++j) {
+                    if (j < 0 || j >= static_cast<int>(groups.size()) || j == mineIdx)
+                        continue;
+                    auto nb = getCached(groups[j]);
+                    keep.push_back(nb);
+                    neighbors.push_back(nb->analysis.get());
+                }
+                if (!neighbors.empty()) {
+                    ExtendParams ep;
+                    ep.radius = pp.extendNeighbors;
+                    ExtendResult ext = extendReference(*center->analysis, neighbors, ep);
+                    center->extendedRef = ext.reference;
+                    center->effectiveN = ext.effectiveN;
+                }
+            }
+
+            auto outputs = renderHoldGroup(*center->analysis, p,
+                                           center->extendedRef);
+            result = outputs[centerIdx - mine.start];
+
+            // 第3層：実効Nの低い画素にだけ空間NR（full モード時）
+            if (!center->effectiveN.empty() &&
+                p.mode == DenoiseMode::FullTemporalIntegration &&
+                p.grainReduction > 0) {
+                // 同一グループの内部フレームは入力（=拡張R）が同一のため、
+                // NLM結果をメモ化して再利用（決定的処理なので出力もビット同一）
+                if (!center->blendIn.empty() &&
+                    result.size() == center->blendIn.size() &&
+                    std::memcmp(result.data, center->blendIn.data,
+                                result.total() * result.elemSize()) == 0) {
+                    result = center->blendOut;
+                } else {
+                    center->blendIn = result.clone();
+                    result = blendSpatialFallback(result, center->effectiveN,
+                                                  center->analysis->grainSigma,
+                                                  p.grainReduction);
+                    center->blendOut = result;
+                }
+            }
+
+            // 欠陥トグル：ライン／スキャンノイズ（グループRで一度だけ検出し、
+            // 出力フレームに補正を適用）
+            if ((pp.lineNoise || pp.scanNoise) && !center->defectsScanned) {
+                const cv::Mat& ref = center->analysis->reference;
+                if (pp.lineNoise) {
+                    center->lineRows = detectLineNoise(ref, 0);
+                    center->lineCols = detectLineNoise(ref, 1);
+                }
+                if (pp.scanNoise) {
+                    center->scanH = detectScanNoise(ref, 0);
+                    center->scanV = detectScanNoise(ref, 1);
+                }
+                center->defectsScanned = true;
+            }
+            if (pp.lineNoise && (!center->lineRows.empty() || !center->lineCols.empty())) {
+                result = correctLineNoise(result, center->lineRows, 0);
+                result = correctLineNoise(result, center->lineCols, 1);
+            }
+            if (pp.scanNoise && (!center->scanH.empty() || !center->scanV.empty())) {
+                result = correctScanNoise(result, center->analysis->reference,
+                                          center->scanH, 0);
+                result = correctScanNoise(result, center->analysis->reference,
+                                          center->scanV, 1);
+            }
+
+            logLine("render t=%.1f %dx%d window=%zu group=[%d-%d] sigma=%.2f "
+                    "ext=%s unsafe=%d",
+                    t, srcImg.width(), srcImg.height(), window.size(), mine.start,
+                    mine.end, center->analysis->grainSigma,
+                    center->extendedRef.empty() ? "off" : "on",
+                    center->analysis->integrationUnsafe ? 1 : 0);
+        }
+
+        writeMat(result, srcImg, dstImg);
         releaseImage(srcImg);
         releaseImage(dstImg);
         return kOfxStatOK;
+    } catch (const cv::Exception& e) {
+        logLine("Exception in render (OpenCV): %s", e.what());
+        if (srcImg.valid()) releaseImage(srcImg);
+        if (dstImg.valid()) releaseImage(dstImg);
+        return kOfxStatFailed;
+    } catch (const std::exception& e) {
+        logLine("Exception in render: %s", e.what());
+        if (srcImg.valid()) releaseImage(srcImg);
+        if (dstImg.valid()) releaseImage(dstImg);
+        return kOfxStatFailed;
+    } catch (...) {
+        logLine("Unknown exception in render.");
+        if (srcImg.valid()) releaseImage(srcImg);
+        if (dstImg.valid()) releaseImage(dstImg);
+        return kOfxStatFailed;
     }
-
-    // クリップのフレーム範囲を取得（範囲外はホストがクランプ複製を返すため、
-    // そもそも要求しない。実測：クリップ先頭で複製がウィンドウに混入していた）
-    double clipRange[2] = {-1e18, 1e18};
-    {
-        OfxPropertySetHandle clipProps = nullptr;
-        if (gEffect->clipGetPropertySet(srcClip, &clipProps) == kOfxStatOK &&
-            clipProps) {
-            gProp->propGetDoubleN(clipProps, kOfxImageEffectPropFrameRange, 2,
-                                  clipRange);
-        }
-    }
-
-    // ウィンドウ収集（取得に失敗した時刻はスキップ＝クリップ端で自然に縮む）
-    std::vector<cv::Mat> window;
-    std::vector<double> times;
-    int centerIdx = -1;
-    for (int dt = -radius; dt <= radius; ++dt) {
-        double tt = t + dt;
-        if (dt == 0) {
-            centerIdx = static_cast<int>(window.size());
-            window.push_back(toMat(srcImg));
-            times.push_back(t);
-            continue;
-        }
-        if (tt < clipRange[0] || tt > clipRange[1]) continue;
-        OfxImg img;
-        if (!fetchImage(srcClip, tt, img)) continue;
-        if (img.width() == srcImg.width() && img.height() == srcImg.height()) {
-            window.push_back(toMat(img));
-            times.push_back(tt);
-        }
-        releaseImage(img);
-    }
-
-    cv::Mat result;
-    if (window.size() < 2 || centerIdx < 0) {
-        // 時間方向アクセス不可のホスト：パススルーに退化（安全側）
-        logLine("render t=%.1f: temporal access unavailable -> passthrough", t);
-        result = window.empty() ? toMat(srcImg)
-                                : window[std::max(centerIdx, 0)];
-    } else {
-        // ウィンドウ内で保持グループ検出（ドリフト検査込み）。
-        // 同一 t の再レンダー用にキャッシュする（結果は決定的で同一）
-        Instance* instD = instanceOf(effect);
-        auto detKey = std::make_pair(t, srcImg.width());
-        std::shared_ptr<DetectResult> det;
-        if (instD) {
-            std::lock_guard<std::mutex> lock(instD->mutex);
-            auto it = instD->detectCache.find(detKey);
-            if (it != instD->detectCache.end()) det = it->second;
-        }
-        DetectionThresholds th;
-        if (!det) {
-            det = std::make_shared<DetectResult>();
-            det->groups = detectHoldGroups(window, th);
-            det->groups = splitDriftingGroups(window, det->groups, th);
-            if (instD) {
-                std::lock_guard<std::mutex> lock(instD->mutex);
-                if (instD->detectCache.size() > 64) instD->detectCache.clear();
-                instD->detectCache[detKey] = det;
-            }
-        }
-        const auto& groups = det->groups;
-        int mineIdx = -1;
-        for (size_t gi = 0; gi < groups.size(); ++gi)
-            if (groups[gi].start <= centerIdx && centerIdx <= groups[gi].end)
-                mineIdx = static_cast<int>(gi);
-        HoldGroup mine = (mineIdx >= 0) ? groups[mineIdx]
-                                        : HoldGroup{centerIdx, centerIdx, 1.0, ""};
-
-        Instance* inst = instanceOf(effect);
-        auto getCached = [&](const HoldGroup& g) -> std::shared_ptr<CachedGroup> {
-            auto key = std::make_pair(times[g.start], srcImg.width());
-            if (inst) {
-                std::lock_guard<std::mutex> lock(inst->mutex);
-                auto it = inst->cache.find(key);
-                if (it != inst->cache.end()) return it->second;
-            }
-            auto cg = std::make_shared<CachedGroup>();
-            std::vector<cv::Mat> gf(window.begin() + g.start,
-                                    window.begin() + g.end + 1);
-            cg->analysis = std::make_shared<GroupAnalysis>(analyzeHoldGroup(gf, p));
-            if (inst) {
-                std::lock_guard<std::mutex> lock(inst->mutex);
-                if (inst->cache.size() > 16) inst->cache.clear();  // 簡易LRU
-                inst->cache[key] = cg;
-            }
-            return cg;
-        };
-
-        std::shared_ptr<CachedGroup> center = getCached(mine);
-
-        // 第2層：カット間拡張統合（ウィンドウ内の隣接グループを統合に参加させる。
-        // 1コマ素材＝グループ長1でも時間統合が効くようになる本命機能）
-        if (pp.extendNeighbors > 0 && mineIdx >= 0 && center->extendedRef.empty()) {
-            std::vector<std::shared_ptr<CachedGroup>> keep;  // 生存保証
-            std::vector<const GroupAnalysis*> neighbors;
-            for (int j = mineIdx - pp.extendNeighbors;
-                 j <= mineIdx + pp.extendNeighbors; ++j) {
-                if (j < 0 || j >= static_cast<int>(groups.size()) || j == mineIdx)
-                    continue;
-                auto nb = getCached(groups[j]);
-                keep.push_back(nb);
-                neighbors.push_back(nb->analysis.get());
-            }
-            if (!neighbors.empty()) {
-                ExtendParams ep;
-                ep.radius = pp.extendNeighbors;
-                ExtendResult ext = extendReference(*center->analysis, neighbors, ep);
-                center->extendedRef = ext.reference;
-                center->effectiveN = ext.effectiveN;
-            }
-        }
-
-        auto outputs = renderHoldGroup(*center->analysis, p,
-                                       center->extendedRef);
-        result = outputs[centerIdx - mine.start];
-
-        // 第3層：実効Nの低い画素にだけ空間NR（full モード時）
-        if (!center->effectiveN.empty() &&
-            p.mode == DenoiseMode::FullTemporalIntegration &&
-            p.grainReduction > 0) {
-            // 同一グループの内部フレームは入力（=拡張R）が同一のため、
-            // NLM結果をメモ化して再利用（決定的処理なので出力もビット同一）
-            if (!center->blendIn.empty() &&
-                result.size() == center->blendIn.size() &&
-                std::memcmp(result.data, center->blendIn.data,
-                            result.total() * result.elemSize()) == 0) {
-                result = center->blendOut;
-            } else {
-                center->blendIn = result.clone();
-                result = blendSpatialFallback(result, center->effectiveN,
-                                              center->analysis->grainSigma,
-                                              p.grainReduction);
-                center->blendOut = result;
-            }
-        }
-
-        // 欠陥トグル：ライン／スキャンノイズ（グループRで一度だけ検出し、
-        // 出力フレームに補正を適用）
-        if ((pp.lineNoise || pp.scanNoise) && !center->defectsScanned) {
-            const cv::Mat& ref = center->analysis->reference;
-            if (pp.lineNoise) {
-                center->lineRows = detectLineNoise(ref, 0);
-                center->lineCols = detectLineNoise(ref, 1);
-            }
-            if (pp.scanNoise) {
-                center->scanH = detectScanNoise(ref, 0);
-                center->scanV = detectScanNoise(ref, 1);
-            }
-            center->defectsScanned = true;
-        }
-        if (pp.lineNoise && (!center->lineRows.empty() || !center->lineCols.empty())) {
-            result = correctLineNoise(result, center->lineRows, 0);
-            result = correctLineNoise(result, center->lineCols, 1);
-        }
-        if (pp.scanNoise && (!center->scanH.empty() || !center->scanV.empty())) {
-            result = correctScanNoise(result, center->analysis->reference,
-                                      center->scanH, 0);
-            result = correctScanNoise(result, center->analysis->reference,
-                                      center->scanV, 1);
-        }
-
-        logLine("render t=%.1f %dx%d window=%zu group=[%d-%d] sigma=%.2f "
-                "ext=%s unsafe=%d",
-                t, srcImg.width(), srcImg.height(), window.size(), mine.start,
-                mine.end, center->analysis->grainSigma,
-                center->extendedRef.empty() ? "off" : "on",
-                center->analysis->integrationUnsafe ? 1 : 0);
-    }
-
-    writeMat(result, srcImg, dstImg);
-    releaseImage(srcImg);
-    releaseImage(dstImg);
-    return kOfxStatOK;
 }
 
 OfxStatus mainEntry(const char* action, const void* handle,

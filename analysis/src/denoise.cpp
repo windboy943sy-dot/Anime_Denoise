@@ -12,6 +12,8 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/photo.hpp>
 #include <opencv2/video/tracking.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/features2d.hpp>
 
 namespace animerestore {
 
@@ -90,6 +92,65 @@ cv::Mat lineArtEdgeMask(const cv::Mat& reference, int dilatePx) {
     return out;
 }
 
+cv::Mat calcCoarseAlignment(const cv::Mat& ref, const cv::Mat& mov) {
+    auto orb = cv::ORB::create(500);
+    std::vector<cv::KeyPoint> kp1, kp2;
+    cv::Mat des1, des2;
+    orb->detectAndCompute(ref, cv::noArray(), kp1, des1);
+    orb->detectAndCompute(mov, cv::noArray(), kp2, des2);
+
+    if (des1.empty() || des2.empty() || kp1.size() < 4 || kp2.size() < 4) {
+        return cv::Mat();
+    }
+
+    cv::BFMatcher matcher(cv::NORM_HAMMING, true);
+    std::vector<cv::DMatch> matches;
+    matcher.match(des1, des2, matches);
+
+    if (matches.size() < 4) {
+        return cv::Mat();
+    }
+
+    std::sort(matches.begin(), matches.end(), [](const cv::DMatch& a, const cv::DMatch& b) {
+        return a.distance < b.distance;
+    });
+
+    std::vector<cv::Point2f> srcPts, dstPts;
+    for (const auto& m : matches) {
+        srcPts.push_back(kp2[m.trainIdx].pt);
+        dstPts.push_back(kp1[m.queryIdx].pt);
+    }
+
+    std::vector<uchar> inliers;
+    cv::Mat warpCoarse = cv::estimateAffinePartial2D(srcPts, dstPts, inliers, cv::RANSAC, 3.0);
+
+    if (warpCoarse.empty()) {
+        return cv::Mat();
+    }
+
+    int inlierCount = 0;
+    for (uchar inlier : inliers) {
+        if (inlier) inlierCount++;
+    }
+    if (inlierCount < 4) {
+        return cv::Mat();
+    }
+
+    double a = warpCoarse.at<double>(0, 0);
+    double b = warpCoarse.at<double>(1, 0);
+    double s = std::sqrt(a * a + b * b);
+    if (s > 0.001) {
+        warpCoarse.at<double>(0, 0) /= s;
+        warpCoarse.at<double>(0, 1) /= s;
+        warpCoarse.at<double>(1, 0) /= s;
+        warpCoarse.at<double>(1, 1) /= s;
+    }
+
+    cv::Mat warpCoarse32F;
+    warpCoarse.convertTo(warpCoarse32F, CV_32F);
+    return warpCoarse32F;
+}
+
 std::vector<cv::Mat> alignGroupFrames(const std::vector<cv::Mat>& frames,
                                       const DenoiseParams& p) {
     if (frames.size() < 2 || !p.align) return frames;
@@ -109,21 +170,33 @@ std::vector<cv::Mat> alignGroupFrames(const std::vector<cv::Mat>& frames,
 
     cv::Mat refSmall = smallGray(frames[refIndex]);
     std::vector<cv::Mat> aligned;
-    cv::TermCriteria criteria(cv::TermCriteria::EPS + cv::TermCriteria::COUNT,
-                              p.eccIterations, 1e-5);
 
     for (size_t i = 0; i < frames.size(); ++i) {
         if (static_cast<int>(i) == refIndex) {
             aligned.push_back(frames[i]);
             continue;
         }
-        cv::Mat warp = cv::Mat::eye(2, 3, CV_32F);
+        cv::Mat movSmall = smallGray(frames[i]);
+        cv::Mat warp = calcCoarseAlignment(refSmall, movSmall);
+        int eccIter = p.eccIterations;
+
+        if (warp.empty()) {
+            warp = cv::Mat::eye(2, 3, CV_32F);
+        } else {
+            eccIter = std::max(5, p.eccIterations / 3);
+        }
+
+        cv::TermCriteria criteria(cv::TermCriteria::EPS + cv::TermCriteria::COUNT,
+                                   eccIter, 1e-5);
         try {
-            cv::findTransformECC(refSmall, smallGray(frames[i]), warp,
+            cv::findTransformECC(refSmall, movSmall, warp,
                                  cv::MOTION_EUCLIDEAN, criteria, cv::noArray(), 5);
         } catch (const cv::Exception&) {
-            aligned.push_back(frames[i]);  // 収束失敗：位置合わせなし（安全側）
-            continue;
+            // ECCが収束失敗した場合でも、粗アライメント結果があればそれを採用（安全側）
+            if (warp.empty()) {
+                aligned.push_back(frames[i]);
+                continue;
+            }
         }
         // 並進成分を元解像度へ換算
         warp.at<float>(0, 2) /= static_cast<float>(scale);
@@ -182,13 +255,55 @@ cv::Mat computeReference(const std::vector<cv::Mat>& framesAligned,
     return result;
 }
 
+cv::Mat guidedFilter(const cv::Mat& guide, const cv::Mat& src, int r, double eps) {
+    cv::Mat guideF, srcF;
+    guide.convertTo(guideF, CV_32FC3, 1.0 / 255.0);
+    src.convertTo(srcF, CV_32FC3, 1.0 / 255.0);
+
+    cv::Size boxSize(2 * r + 1, 2 * r + 1);
+
+    cv::Mat meanI, meanP, meanII, meanIp;
+    cv::boxFilter(guideF, meanI, -1, boxSize);
+    cv::boxFilter(srcF, meanP, -1, boxSize);
+
+    cv::Mat guideF2 = guideF.mul(guideF);
+    cv::Mat guideFsrcF = guideF.mul(srcF);
+
+    cv::boxFilter(guideF2, meanII, -1, boxSize);
+    cv::boxFilter(guideFsrcF, meanIp, -1, boxSize);
+
+    cv::Mat varI = meanII - meanI.mul(meanI);
+    cv::Mat covIp = meanIp - meanI.mul(meanP);
+
+    cv::Mat denom = varI + cv::Scalar::all(eps);
+    cv::Mat a, b;
+    cv::divide(covIp, denom, a);
+    b = meanP - a.mul(meanI);
+
+    cv::Mat meanA, meanB;
+    cv::boxFilter(a, meanA, -1, boxSize);
+    cv::boxFilter(b, meanB, -1, boxSize);
+
+    cv::Mat q = meanA.mul(guideF) + meanB;
+    cv::Mat out;
+    q.convertTo(out, CV_8UC3, 255.0);
+    return out;
+}
+
 cv::Mat spatialDenoiseEdgePreserving(const cv::Mat& frame, double grainSigma,
-                                     double strength, bool protectEdges) {
+                                     double strength, bool protectEdges, bool useNlm) {
     if (strength <= 0) return frame;
-    float h = static_cast<float>(
-        std::clamp(grainSigma * 1.2 * strength, 1.0, 15.0));
+
     cv::Mat denoised;
-    cv::fastNlMeansDenoisingColored(frame, denoised, h, h, 7, 21);
+    if (useNlm) {
+        float h = static_cast<float>(
+            std::clamp(grainSigma * 1.2 * strength, 1.0, 15.0));
+        cv::fastNlMeansDenoisingColored(frame, denoised, h, h, 7, 21);
+    } else {
+        int r = 4;
+        double eps = std::clamp(std::pow(grainSigma / 255.0, 2) * 10.0 * strength, 0.0001, 0.05);
+        denoised = guidedFilter(frame, frame, r, eps);
+    }
 
     if (!protectEdges) return denoised;
 
