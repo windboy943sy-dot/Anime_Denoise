@@ -28,6 +28,9 @@ target_include_directories(animerestore PUBLIC ${OpenCV_INCLUDE_DIRS})
 add_executable(ar_cli tools/ar_cli.cpp)
 target_link_libraries(ar_cli PRIVATE animerestore)
 
+add_executable(verify_performance tools/verify_performance.cpp)
+target_link_libraries(verify_performance PRIVATE animerestore)
+
 # OpenFX プローブプラグイン（Phase 7 準備。ホスト挙動の実測用パススルー）
 # インストール：build/AnimeRestoreProbe.ofx.bundle を /Library/OFX/Plugins/ に置く
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/openfx/include)

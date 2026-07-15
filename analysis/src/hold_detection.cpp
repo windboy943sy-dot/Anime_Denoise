@@ -10,6 +10,8 @@
 #include <map>
 
 #include <opencv2/imgproc.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/features2d.hpp>
 
 namespace animerestore {
 
@@ -192,6 +194,117 @@ double blockSsimFromGray(const cv::Mat& ga, const cv::Mat& gb,
     return count ? sum / count : 1.0;
 }
 
+double blockSsimFromGrayMasked(const cv::Mat& ga, const cv::Mat& gb, const cv::Mat& mask,
+                               int blockSize, double flatStdThreshold) {
+    double sum = 0.0;
+    int count = 0;
+    for (int y = 0; y + blockSize <= ga.rows; y += blockSize) {
+        for (int x = 0; x + blockSize <= ga.cols; x += blockSize) {
+            cv::Rect r(x, y, blockSize, blockSize);
+            cv::Mat blockMask = mask(r);
+            if (cv::countNonZero(blockMask) < (blockSize * blockSize * 0.20)) {
+                continue;
+            }
+            cv::Mat ba = ga(r), bb = gb(r);
+            cv::Scalar meanA, stdA, meanB, stdB;
+            cv::meanStdDev(ba, meanA, stdA);
+            cv::meanStdDev(bb, meanB, stdB);
+            if (stdA[0] < flatStdThreshold && stdB[0] < flatStdThreshold) {
+                cv::Mat fa, fb;
+                ba.convertTo(fa, CV_32F);
+                bb.convertTo(fb, CV_32F);
+                double diff = cv::mean(cv::abs(fa - fb))[0];
+                sum += std::max(0.0, 1.0 - diff / 255.0);
+            } else {
+                sum += ssimUniform7(ba, bb);
+            }
+            ++count;
+        }
+    }
+    return count ? sum / count : 1.0;
+}
+
+double blurredDiffFromGrayMasked(const cv::Mat& ga, const cv::Mat& gb, const cv::Mat& mask) {
+    cv::Mat fa, fb;
+    ga.convertTo(fa, CV_32F);
+    gb.convertTo(fb, CV_32F);
+    cv::Mat diff = cv::abs(fa - fb);
+    cv::Scalar meanVal = cv::mean(diff, mask);
+    return meanVal[0];
+}
+
+cv::Mat estimateGlobalMotion(const cv::Mat& refGray, const cv::Mat& movGray) {
+    auto orb = cv::ORB::create(300);
+    std::vector<cv::KeyPoint> kp1, kp2;
+    cv::Mat des1, des2;
+    orb->detectAndCompute(refGray, cv::noArray(), kp1, des1);
+    orb->detectAndCompute(movGray, cv::noArray(), kp2, des2);
+
+    if (des1.empty() || des2.empty() || kp1.size() < 4 || kp2.size() < 4) {
+        return cv::Mat();
+    }
+
+    cv::BFMatcher matcher(cv::NORM_HAMMING, true);
+    std::vector<cv::DMatch> matches;
+    matcher.match(des1, des2, matches);
+
+    if (matches.size() < 4) {
+        return cv::Mat();
+    }
+
+    std::sort(matches.begin(), matches.end(), [](const cv::DMatch& a, const cv::DMatch& b) {
+        return a.distance < b.distance;
+    });
+
+    std::vector<cv::Point2f> srcPts, dstPts;
+    for (const auto& m : matches) {
+        srcPts.push_back(kp2[m.trainIdx].pt);
+        dstPts.push_back(kp1[m.queryIdx].pt);
+    }
+
+    std::vector<uchar> inliers;
+    cv::Mat warp = cv::estimateAffinePartial2D(srcPts, dstPts, inliers, cv::RANSAC, 1.5);
+    if (warp.empty()) return cv::Mat();
+
+    double a = warp.at<double>(0, 0);
+    double b = warp.at<double>(1, 0);
+    double s = std::sqrt(a * a + b * b);
+    if (s < 0.97 || s > 1.03) {
+        return cv::Mat(); // スケール変化が大きすぎる＝前景引きずり誤推定
+    }
+
+    if (s > 0.001) {
+        warp.at<double>(0, 0) /= s;
+        warp.at<double>(0, 1) /= s;
+        warp.at<double>(1, 0) /= s;
+        warp.at<double>(1, 1) /= s;
+    }
+    return warp;
+}
+
+bool isSignificantMotion(const cv::Mat& warp) {
+    if (warp.empty()) return false;
+    double tx = warp.at<double>(0, 2);
+    double ty = warp.at<double>(1, 2);
+    double a = warp.at<double>(0, 0);
+    double b = warp.at<double>(1, 0);
+    double theta = std::abs(std::atan2(b, a));
+    return (std::sqrt(tx*tx + ty*ty) > 0.5) || (theta > 0.002);
+}
+
+cv::Mat computeForegroundMask(const cv::Mat& refGray, const cv::Mat& movGray, const cv::Mat& warp) {
+    cv::Mat warped;
+    cv::warpAffine(movGray, warped, warp, refGray.size(), cv::INTER_LINEAR, cv::BORDER_REFLECT);
+    cv::Mat diff;
+    cv::absdiff(refGray, warped, diff);
+    cv::Mat mask;
+    cv::threshold(diff, mask, 12, 255, cv::THRESH_BINARY);
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 9));
+    cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+    cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
+    return mask;
+}
+
 }  // namespace
 
 double blockSsim(const cv::Mat& frameA, const cv::Mat& frameB,
@@ -236,9 +349,35 @@ std::vector<HoldGroup> detectHoldGroups(const std::vector<cv::Mat>& frames,
         bool isSame = false;
         double conf = 0.0;
         if (quickScore <= th.coarsePhashThreshold) {
-            double diffScore = blurredDiffFromGray(grayOf(i - 1), grayOf(i));
-            double ssimScore = blockSsimFromGray(grayOf(i - 1), grayOf(i),
+            double diffScore = 0.0;
+            double ssimScore = 0.0;
+            if (th.useRegionSegment) {
+                cv::Mat warp = estimateGlobalMotion(grayOf(i - 1), grayOf(i));
+                if (isSignificantMotion(warp)) {
+                    cv::Mat fgMask = computeForegroundMask(grayOf(i - 1), grayOf(i), warp);
+                    double fgAreaRatio = static_cast<double>(cv::countNonZero(fgMask)) / fgMask.total();
+                    if (fgAreaRatio >= 0.01 && fgAreaRatio <= 0.80) {
+                        diffScore = blurredDiffFromGrayMasked(grayOf(i - 1), grayOf(i), fgMask);
+                        ssimScore = blockSsimFromGrayMasked(grayOf(i - 1), grayOf(i), fgMask,
+                                                            th.blockSize, 2.0);
+                    } else {
+                        // 全体アフィンパン: ワープ後の全体画像を比較
+                        cv::Mat warpedB;
+                        cv::warpAffine(frames[i], warpedB, warp, frames[i - 1].size(),
+                                       cv::INTER_LINEAR, cv::BORDER_REFLECT);
+                        diffScore = blurredMeanAbsDiff(frames[i - 1], warpedB, th.blurKsize);
+                        ssimScore = blockSsim(frames[i - 1], warpedB, th.blockSize, th.blurKsize, 2.0);
+                    }
+                } else {
+                    diffScore = blurredDiffFromGray(grayOf(i - 1), grayOf(i));
+                    ssimScore = blockSsimFromGray(grayOf(i - 1), grayOf(i),
                                                  th.blockSize, 2.0);
+                }
+            } else {
+                diffScore = blurredDiffFromGray(grayOf(i - 1), grayOf(i));
+                ssimScore = blockSsimFromGray(grayOf(i - 1), grayOf(i),
+                                             th.blockSize, 2.0);
+            }
             if (diffScore < th.diffThreshold && ssimScore > th.ssimThreshold) {
                 isSame = true;
                 conf = confidence(diffScore, ssimScore);

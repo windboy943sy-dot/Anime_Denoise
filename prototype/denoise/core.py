@@ -70,6 +70,44 @@ class DenoiseParams:
 # サブピクセル位置合わせ（ゲートウィーブ補正）
 # ---------------------------------------------------------------------------
 
+def _get_coarse_alignment(gray_ref: np.ndarray, gray_mov: np.ndarray) -> np.ndarray | None:
+    """ORB特徴点マッチングとRANSACアフィン推定を用いて、粗アライメント（2x3剛体変換行列）を求める。"""
+    orb = cv2.ORB_create(nfeatures=500)
+    kp1, des1 = orb.detectAndCompute(gray_ref, None)
+    kp2, des2 = orb.detectAndCompute(gray_mov, None)
+
+    if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
+        return None
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+
+    if len(matches) < 4:
+        return None
+
+    matches = sorted(matches, key=lambda x: x.distance)
+    src_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+
+    # 剛体変換（並進＋回転＋一様スケール）をロバスト推定
+    warp_coarse, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+
+    if warp_coarse is None or np.sum(inliers) < 4:
+        return None
+
+    # ウィーブ（並進＋回転のみ）に合わせるため、スケール成分を1に正規化
+    a = warp_coarse[0, 0]
+    b = warp_coarse[1, 0]
+    s = np.sqrt(a*a + b*b)
+    if s > 0.001:
+        warp_coarse[0, 0] /= s
+        warp_coarse[0, 1] /= s
+        warp_coarse[1, 0] /= s
+        warp_coarse[1, 1] /= s
+
+    return warp_coarse.astype(np.float32)
+
+
 def _ecc_align_pair(gray_ref_small: np.ndarray, gray_mov_small: np.ndarray,
                     params: DenoiseParams) -> np.ndarray | None:
     """縮小画像同士でECCを回し、workスケールの2x3行列を返す（失敗時 None）。
@@ -80,16 +118,26 @@ def _ecc_align_pair(gray_ref_small: np.ndarray, gray_mov_small: np.ndarray,
     低速ズーム等の「グループ内で絵が動く」ケースは位置合わせでは救えないため、
     analyze_hold_group の統合安全ガード（端点エッジ残差）で統合自体を止める。
     """
-    warp = np.eye(2, 3, dtype=np.float32)
+    warp = _get_coarse_alignment(gray_ref_small, gray_mov_small)
+
+    if warp is None:
+        warp = np.eye(2, 3, dtype=np.float32)
+        ecc_iter = params.ecc_iterations
+    else:
+        # 粗アライメントで良い初期値が得られた場合は、ECCのイテレーション数を1/3に削減して高速化する
+        ecc_iter = max(5, params.ecc_iterations // 3)
+
     criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-                params.ecc_iterations, 1e-5)
+                ecc_iter, 1e-5)
     try:
         # warpAffine(mov, warp) ≒ ref になる向き
         _, warp = cv2.findTransformECC(gray_ref_small, gray_mov_small, warp,
                                        cv2.MOTION_EUCLIDEAN, criteria, None, 5)
         return warp
     except cv2.error:
-        return None
+        # ECCが収束に失敗した場合でも、粗アライメント推定が成功していれば、
+        # 単位行列（位置合わせなし）よりは良好な補正値であるためフォールバックとして採用する
+        return warp if warp is not None else None
 
 
 def align_group_frames(frames: list[np.ndarray],
@@ -321,22 +369,55 @@ def detect_dust_masks_group(residual_stack: np.ndarray,
 # 空間デノイズ（動領域用・エッジ保護つき）
 # ---------------------------------------------------------------------------
 
+def guided_filter(guide: np.ndarray, src: np.ndarray, r: int, eps: float) -> np.ndarray:
+    """Guided Filterの自前実装 (ガイド画像: guide, フィルタ対象: src)"""
+    guide_f = guide.astype(np.float32) / 255.0
+    src_f = src.astype(np.float32) / 255.0
+    box_size = (2 * r + 1, 2 * r + 1)
+
+    mean_I = cv2.boxFilter(guide_f, -1, box_size)
+    mean_p = cv2.boxFilter(src_f, -1, box_size)
+    mean_II = cv2.boxFilter(guide_f * guide_f, -1, box_size)
+    mean_Ip = cv2.boxFilter(guide_f * src_f, -1, box_size)
+
+    var_I = mean_II - mean_I * mean_I
+    cov_Ip = mean_Ip - mean_I * mean_p
+
+    a = cov_Ip / (var_I + eps)
+    b = mean_p - a * mean_I
+
+    mean_a = cv2.boxFilter(a, -1, box_size)
+    mean_b = cv2.boxFilter(b, -1, box_size)
+
+    q = mean_a * guide_f + mean_b
+    return np.clip(q * 255.0, 0, 255).astype(np.uint8)
+
+
 def spatial_denoise_edge_preserving(frame: np.ndarray, grain_sigma: float,
                                     strength: float = 1.0,
-                                    protect_edges: bool = True) -> np.ndarray:
+                                    protect_edges: bool = True,
+                                    use_nlm: bool = False) -> np.ndarray:
     """単独フレーム内で完結する、線画保護つき空間デノイズ。
 
     アニメは「線画＋平坦な色面」で構成されるため：
-      - ベースはNLM（fastNlMeansDenoisingColored）。hはグレインσから自動設定
+      - デフォルトは Guided Filter による超高速平滑化。
+      - use_nlm=True の場合は従来の NLM（fastNlMeansDenoisingColored）を使用。hはグレインσから自動設定
       - 線画エッジ近傍は元画素へフォールバックし、輪郭のシャープさを完全保持
     時間方向の情報は使わないため、texture_preserving モードの
     grain_reduction としても安全に使える（フレーム間の揺らぎは保たれる）。
     """
     if strength <= 0:
         return frame
-    h_luma = float(np.clip(grain_sigma * 1.2 * strength, 1.0, 15.0))
-    denoised = cv2.fastNlMeansDenoisingColored(
-        frame, None, h_luma, h_luma, 7, 21)
+
+    if use_nlm:
+        h_luma = float(np.clip(grain_sigma * 1.2 * strength, 1.0, 15.0))
+        denoised = cv2.fastNlMeansDenoisingColored(
+            frame, None, h_luma, h_luma, 7, 21)
+    else:
+        # Guided Filter の適用。r(半径)とeps(正則化パラメータ)はグレインσと強度から決定
+        r = 4
+        eps = float(np.clip((grain_sigma / 255.0) ** 2 * 10.0 * strength, 0.0001, 0.05))
+        denoised = guided_filter(frame, frame, r, eps)
 
     if protect_edges:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)

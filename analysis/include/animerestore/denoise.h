@@ -85,9 +85,10 @@ std::vector<cv::Mat> renderHoldGroup(const GroupAnalysis& analysis,
 // 線画・セル境界のエッジマスク（XDoG、255=線近傍。ダスト保護・第2層で共有）
 cv::Mat lineArtEdgeMask(const cv::Mat& reference, int dilatePx = 3);
 
-// 線画保護つき空間NR（フレーム単独で完結。NLM＋Cannyエッジフォールバック）
+// 線画保護つき空間NR（フレーム単独で完結。Guided Filter / NLM＋Cannyエッジフォールバック）
 cv::Mat spatialDenoiseEdgePreserving(const cv::Mat& frame, double grainSigma,
                                      double strength = 1.0,
-                                     bool protectEdges = true);
+                                     bool protectEdges = true,
+                                     bool useNlm = false);
 
 }  // namespace animerestore
