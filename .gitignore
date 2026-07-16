@@ -9,6 +9,9 @@ __pycache__/
 # C++ ビルド成果物
 analysis/build/
 
+# インストーラーのビルド成果物（pkg/dmg・展開済みバンドル。make_installer.sh で再生成）
+analysis/packaging/dist/
+
 # 外部SDK（取得方法は analysis/README.md 参照: git clone openfx）
 analysis/third_party/
 
