@@ -1,6 +1,29 @@
-# アニメ特化ノイズ復元 OpenFXプラグイン
+# 映像復元 検知・解析エンジン ＋ アニメ特化ノイズ復元 OpenFXプラグイン
 
-設計提案書・実装ロードマップに基づくプロジェクト。現在は **Phase 1（保持フレーム検出）・Phase 2（動き分類）・Phase 3（参照像R・ダスト検出・デノイズ出力）のプロトタイプ実装済み** の段階。
+設計提案書・実装ロードマップに基づくプロジェクト。
+
+## 汎用「検知・解析エンジン」（Phase 1・最優先・新規）
+
+ノイズ・ダスト・スクラッチを **高精度に検知・分類・解析**する中核モジュール
+（除去は行わない）。2本の技術サーベイ（`docs/reference/` のダスト・スクラッチ
+検知／ノイズ検知）を根拠に、`DefectMap`/`NoiseProfile` を唯一の対外契約とする
+拡張性重視の設計。
+
+- 実装: `prototype/detection_engine/`（numpy/scipy のみ、OFX/OpenCV 非依存）
+- 設計書: `docs/detection_engine_architecture.md`
+- 知識管理: `docs/detection_engine_decision_log.md`（判断・失敗・ベンチ・誤検知事例・保留）
+- 実測（合成GT, 2026-07-19）: ダスト適合率 1.00／再現率 ~1.00、傷 recall 1.00・
+  誤検知トラック 0、ノイズσ相対誤差 <6%（`prototype/tests/test_detection_engine.py`）
+
+```bash
+cd prototype
+python run_detection_engine.py --demo --output /tmp/detect_demo   # 合成デモ（cv2不要）
+python tests/test_detection_engine.py                            # 精度検証
+```
+
+## アニメ特化ノイズ復元パイプライン（既存）
+
+現在は **Phase 1（保持フレーム検出）・Phase 2（動き分類）・Phase 3（参照像R・ダスト検出・デノイズ出力）のプロトタイプ実装済み** の段階。
 詳細は `docs/phase1_phase2_status.md`（Phase 1・2）と `docs/denoise_method_survey.md`（手法調査とデノイズ方式・Phase 3）を参照。
 
 ## ディレクトリ構成
